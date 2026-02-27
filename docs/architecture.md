@@ -8,32 +8,37 @@ Each cluster is provisioned inside a dedicated VPC with a two-tier network: a pu
 flowchart TB
     Internet(["Internet"])
 
-    subgraph vpc["AWS VPC — 10.0.0.0/16"]
-        IGW["Internet Gateway"]
+    subgraph VPC["VPC — 10.0.0.0/16"]
+        IGW[Internet Gateway]
 
-        subgraph pub["Public Subnet — 10.0.1.0/24"]
-            NLB["Network Load Balancer\n━━━━━━━━━━━━━━━━━━━━━━━━\nElastic IP  =  ControlPlaneIP\n\nListener TCP 6443 → k8s API TG\nListener TCP 50000 → Talos API TG"]
-            NAT["NAT Gateway\n(own Elastic IP)"]
+        subgraph Public["Public Subnet — 10.0.1.0/24"]
+            NLB["NLB / Elastic IP<br/>TCP 6443 · TCP 50000"]
+            NAT[NAT Gateway]
         end
 
-        subgraph priv["Private Subnet — 10.0.2.0/24  ·  no public IPs"]
-            CP["Control Plane\nEC2 (default: t3.medium)"]
-            W["Workers × N\nEC2 (default: t3.medium)"]
+        subgraph Private["Private Subnet — 10.0.2.0/24 · no public IPs"]
+            CP[Control Plane EC2]
+            W["Workers × N EC2"]
         end
     end
 
-    Internet <-->|"internet"| IGW
-    IGW -->|"inbound TCP 6443 / 50000"| NLB
-    NLB -->|"TCP 6443"| CP
-    NLB -->|"TCP 50000"| CP
-    CP & W -->|"outbound\n(image pulls, DNS, etc.)"| NAT
-    NAT --> IGW
+    Internet -->|inbound| IGW
+    IGW --> NLB
+    NLB -->|k8s API 6443| CP
+    NLB -->|Talos API 50000| CP
+    CP -.->|outbound| NAT
+    W -.->|outbound| NAT
+    NAT -.-> IGW
+    IGW -.->|outbound| Internet
 ```
+
+Solid arrows = inbound path (Internet → NLB → Control Plane).
+Dashed arrows = outbound path (instances → NAT Gateway → internet).
 
 **Key design decisions:**
 
-- The cluster's Elastic IP is pinned to the NLB at creation time via `SubnetMappings`. It is baked into the Talos machine configs as the Kubernetes API endpoint before any instances are launched.
-- Security groups allow TCP 6443 and TCP 50000 only from the VPC CIDR (`10.0.0.0/16`). NLB health checks originate from within the VPC, so this is sufficient. Direct internet access to the private instances is not possible.
+- The cluster's Elastic IP is pinned to the NLB at creation time. It is baked into the Talos machine configs as the Kubernetes API endpoint before any instances are launched.
+- Security groups allow TCP 6443 and TCP 50000 only from the VPC CIDR (`10.0.0.0/16`). NLB health checks originate from within the VPC, so this is sufficient.
 - The NAT Gateway gives private instances outbound internet access (container image pulls, time sync, etc.) without exposing any inbound surface.
 - Each cluster gets its own VPC, so clusters are fully isolated from each other.
 
@@ -43,39 +48,35 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    subgraph cmd["cmd/cluster/  —  CLI (cobra)"]
-        CLI["main.go\ncreate | delete | kubeconfig"]
+    subgraph cmd["cmd/cluster — CLI"]
+        CLI["main.go<br/>create · delete · kubeconfig"]
     end
 
-    subgraph internal["internal/"]
-        subgraph cluster["cluster/"]
-            MGR["manager.go\nCreate() / Delete()"]
-            TYPES["types.go\nClusterConfig · ClusterState · NodeInfo"]
-        end
+    subgraph mgmt["internal/cluster"]
+        MGR["manager.go<br/>Create / Delete"]
+        TYPES["types.go<br/>ClusterConfig · ClusterState"]
+    end
 
-        subgraph aws["aws/"]
-            EC2pkg["ec2.go\nAllocateEIP · LaunchInstance\nWaitForInstanceRunning · TerminateInstances"]
-            VPCpkg["vpc.go\nCreateNetworking · CreateSecurityGroups\nDeleteNetworking · WaitForNATGatewayDeleted"]
-            NLBpkg["nlb.go\nCreateNLB · RegisterTargetsCP · DeleteNLB"]
-            AMIpkg["ami.go\nFindTalosAMI"]
-            CLIENTpkg["client.go\nNewEC2Client · NewELBv2Client"]
-        end
+    subgraph awspkg["internal/aws"]
+        EC2F["ec2.go<br/>AllocateEIP · LaunchInstance<br/>WaitForRunning · Terminate"]
+        VPCF["vpc.go<br/>CreateNetworking<br/>CreateSecurityGroups<br/>DeleteNetworking"]
+        NLBF["nlb.go<br/>CreateNLB<br/>RegisterTargetsCP<br/>DeleteNLB"]
+        AMIF["ami.go<br/>FindTalosAMI"]
+    end
 
-        subgraph talos["talos/"]
-            CFGpkg["config.go\nGenerateConfigs"]
-            BOOTpkg["bootstrap.go\nWaitForTalosAPI · BootstrapCluster · FetchKubeconfig"]
-        end
+    subgraph talpkg["internal/talos"]
+        CFGF["config.go<br/>GenerateConfigs"]
+        BOOTF["bootstrap.go<br/>WaitForTalosAPI<br/>BootstrapCluster<br/>FetchKubeconfig"]
     end
 
     CLI --> MGR
     MGR --> TYPES
-    MGR --> EC2pkg
-    MGR --> VPCpkg
-    MGR --> NLBpkg
-    MGR --> AMIpkg
-    MGR --> CLIENTpkg
-    MGR --> CFGpkg
-    MGR --> BOOTpkg
+    MGR --> EC2F
+    MGR --> VPCF
+    MGR --> NLBF
+    MGR --> AMIF
+    MGR --> CFGF
+    MGR --> BOOTF
 ```
 
 ---
@@ -95,33 +96,38 @@ sequenceDiagram
     MGR->>AWS: FindTalosAMI
     AWS-->>MGR: ami-id
 
-    MGR->>AWS: AllocateEIP  ← saved to state
-    AWS-->>MGR: eip-id, publicIP (= ControlPlaneIP)
+    MGR->>AWS: AllocateEIP
+    AWS-->>MGR: eip-id + publicIP (ControlPlaneIP)
+    Note over MGR: saved to state file
 
     MGR->>TAL: GenerateConfigs(ControlPlaneIP)
     TAL-->>MGR: controlplane.yaml, worker.yaml, talosconfig
 
-    MGR->>AWS: CreateNetworking (VPC, subnets, IGW, NAT GW, route tables)
-    Note over AWS: NAT GW takes ~60s to reach "available"
-    AWS-->>MGR: netIDs  ← saved to state
+    MGR->>AWS: CreateNetworking
+    Note over AWS: VPC, subnets, IGW, NAT GW, route tables<br/>NAT GW takes ~60s to reach available
+    AWS-->>MGR: netIDs
+    Note over MGR: saved to state file
 
     MGR->>AWS: CreateSecurityGroups
-    AWS-->>MGR: cpSGID, workerSGID  ← saved to state
+    AWS-->>MGR: cpSGID, workerSGID
+    Note over MGR: saved to state file
 
     MGR->>ELB: CreateNLB (EIP pinned to NLB)
-    Note over ELB: NLB takes ~60s to reach "active"
-    ELB-->>MGR: nlbARN, cpTGARN, talosTGARN  ← saved to state
+    Note over ELB: NLB takes ~60s to reach active
+    ELB-->>MGR: nlbARN, cpTGARN, talosTGARN
+    Note over MGR: saved to state file
 
     MGR->>AWS: LaunchInstance (control plane, private subnet)
-    AWS-->>MGR: cpInstanceID  ← saved to state
+    AWS-->>MGR: cpInstanceID
+    Note over MGR: saved to state file
 
     MGR->>AWS: WaitForInstanceRunning (cp)
-
-    MGR->>ELB: RegisterTargetsCP (cp → both TGs)
+    MGR->>ELB: RegisterTargetsCP (cp in both TGs)
 
     loop worker 0..N
         MGR->>AWS: LaunchInstance (worker, private subnet)
-        AWS-->>MGR: workerID  ← saved to state
+        AWS-->>MGR: workerID
+        Note over MGR: saved to state file
     end
 
     MGR->>AWS: WaitForInstanceRunning (all workers)
@@ -131,9 +137,8 @@ sequenceDiagram
 
     MGR->>TAL: BootstrapCluster (initiates etcd)
 
-    MGR-->>CLI: ClusterState{status: "running"}, talosconfig
-    CLI->>CLI: write <name>-state.json
-    CLI->>CLI: write <name>-talosconfig
+    MGR-->>CLI: ClusterState + talosconfig
+    CLI->>CLI: write state.json + talosconfig
 ```
 
 ---
@@ -150,22 +155,19 @@ sequenceDiagram
     CLI->>MGR: Delete(state)
 
     MGR->>AWS: TerminateInstances (cp + workers)
-    Note over AWS: Waits up to 15 min for "terminated"
+    Note over AWS: waits up to 15 min for terminated
 
-    MGR->>ELB: DeleteLoadBalancer (nlbARN)
-    Note over ELB: Waits for NLB to be fully deleted
-    ELB-->>MGR: ok
-    MGR->>ELB: DeleteTargetGroup × 2
-    ELB-->>MGR: ok
+    MGR->>ELB: DeleteLoadBalancer
+    Note over ELB: waits for NLB fully deleted
+    MGR->>ELB: DeleteTargetGroup x2
 
     MGR->>AWS: ReleaseAddress (cluster EIP)
 
     MGR->>AWS: DeleteNetworking
-    Note over AWS: revoke SG rules → delete SGs<br/>delete private RT → delete public RT<br/>DeleteNatGateway → wait ~60s → release NAT EIP<br/>delete private subnet → delete public subnet<br/>detach IGW → delete IGW → delete VPC
-    AWS-->>MGR: ok
+    Note over AWS: revoke SG rules, delete SGs<br/>delete route tables<br/>DeleteNatGateway + wait ~60s<br/>release NAT EIP<br/>delete subnets, IGW, VPC
 
-    MGR-->>CLI: nil (success)
-    CLI->>CLI: update <name>-state.json status: "deleted"
+    MGR-->>CLI: success
+    CLI->>CLI: update state.json status deleted
 ```
 
 ---
