@@ -12,18 +12,27 @@ type ClusterConfig struct {
 	WorkerType       string `json:"worker_type"`
 	WorkerCount      int    `json:"worker_count"`
 
-	// Populated during Create
-	AMIID            string   `json:"ami_id"`
-	VPCID            string   `json:"vpc_id"`
-	SubnetID         string   `json:"subnet_id"`
-	IGWID            string   `json:"igw_id"`
-	RouteTableID     string   `json:"route_table_id"`
-	ControlPlaneSGID string   `json:"control_plane_sg_id"`
-	WorkerSGID       string   `json:"worker_sg_id"`
-	EIPID            string   `json:"eip_id"`
-	ControlPlaneIP   string   `json:"control_plane_ip"`
-	ControlPlaneID   string   `json:"control_plane_id"`
-	WorkerIDs        []string `json:"worker_ids"`
+	// Populated during Create — networking
+	AMIID               string   `json:"ami_id"`
+	VPCID               string   `json:"vpc_id"`
+	PublicSubnetID      string   `json:"public_subnet_id"`       // 10.0.1.0/24 — NLB + NAT GW
+	SubnetID            string   `json:"subnet_id"`              // 10.0.2.0/24 — EC2 instances (private)
+	IGWID               string   `json:"igw_id"`
+	RouteTableID        string   `json:"route_table_id"`         // public route table → IGW
+	PrivateRouteTableID string   `json:"private_route_table_id"` // private route table → NAT GW
+	NATGatewayID        string   `json:"nat_gateway_id"`
+	NATGatewayEIPID     string   `json:"nat_gateway_eip_id"`
+	ControlPlaneSGID    string   `json:"control_plane_sg_id"`
+	WorkerSGID          string   `json:"worker_sg_id"`
+	// Populated during Create — load balancer
+	EIPID               string   `json:"eip_id"`
+	ControlPlaneIP      string   `json:"control_plane_ip"`       // NLB Elastic IP
+	NLBARN              string   `json:"nlb_arn"`
+	CPTargetGroupARN    string   `json:"cp_target_group_arn"`    // TCP:6443
+	TalosTargetGroupARN string   `json:"talos_target_group_arn"` // TCP:50000
+	// Populated during Create — instances
+	ControlPlaneID      string   `json:"control_plane_id"`
+	WorkerIDs           []string `json:"worker_ids"`
 }
 
 // AllInstanceIDs returns all instance IDs (control plane + workers).
