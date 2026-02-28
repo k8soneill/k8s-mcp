@@ -50,6 +50,14 @@ type DeleteNetworkingParams struct {
 func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName string, ct ClusterTags) (NetworkIDs, error) {
 	var ids NetworkIDs
 
+	// Pick the first available AZ in the region so both subnets are co-located.
+	// NLB cross-zone load balancing is off by default, so the NLB node (public
+	// subnet) can only route to targets in the same AZ (private subnet).
+	az, err := firstAvailableAZ(ctx, client)
+	if err != nil {
+		return ids, fmt.Errorf("find available AZ: %w", err)
+	}
+
 	// --- VPC ---
 	vpcOut, err := client.CreateVpc(ctx, &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
@@ -78,8 +86,9 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 
 	// --- Public subnet (NLB + NAT GW — no public IPs auto-assigned) ---
 	pubSubOut, err := client.CreateSubnet(ctx, &ec2.CreateSubnetInput{
-		VpcId:     aws.String(ids.VPCID),
-		CidrBlock: aws.String("10.0.1.0/24"),
+		VpcId:            aws.String(ids.VPCID),
+		CidrBlock:        aws.String("10.0.1.0/24"),
+		AvailabilityZone: aws.String(az),
 		TagSpecifications: []types.TagSpecification{
 			clusterResourceTag(types.ResourceTypeSubnet, "public-subnet", ct),
 		},
@@ -91,8 +100,9 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 
 	// --- Private subnet (EC2 instances — no public IPs) ---
 	privSubOut, err := client.CreateSubnet(ctx, &ec2.CreateSubnetInput{
-		VpcId:     aws.String(ids.VPCID),
-		CidrBlock: aws.String("10.0.2.0/24"),
+		VpcId:            aws.String(ids.VPCID),
+		CidrBlock:        aws.String("10.0.2.0/24"),
+		AvailabilityZone: aws.String(az),
 		TagSpecifications: []types.TagSpecification{
 			clusterResourceTag(types.ResourceTypeSubnet, "private-subnet", ct),
 		},
@@ -252,12 +262,19 @@ func WaitForNATGatewayDeleted(ctx context.Context, client *ec2.Client, natGWID s
 	return fmt.Errorf("NAT gateway %s did not reach deleted state within 5 minutes", natGWID)
 }
 
+// SGAllowedCIDRs holds the user-specified allowed source CIDRs for each service.
+// The VPC CIDR is always appended automatically for NLB health checks.
+type SGAllowedCIDRs struct {
+	TalosAPI []string // port 50000
+	K8sAPI   []string // port 6443
+	Ingress  []string // ports 80/443 (future)
+}
+
 // CreateSecurityGroups provisions the control plane and worker security groups.
-// Ports 6443 and 50000 are restricted to the VPC CIDR — NLB health checks
-// originate from within the VPC so this is sufficient while blocking direct
-// internet access to the private instances.
+// Ports 6443 and 50000 are opened to the user-specified CIDRs plus the VPC CIDR
+// (needed for NLB health checks which originate from within the VPC).
 // Returns (controlPlaneSGID, workerSGID, error).
-func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, clusterName string, ct ClusterTags) (string, string, error) {
+func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, clusterName string, ct ClusterTags, allowed SGAllowedCIDRs) (string, string, error) {
 	const vpcCIDR = "10.0.0.0/16"
 
 	// --- Control plane SG ---
@@ -289,12 +306,11 @@ func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, cluste
 	wkSGID := aws.ToString(wkSGOut.GroupId)
 
 	// --- Control plane ingress rules ---
-	// TCP 6443 and 50000 allow from VPC CIDR only (NLB health checks + internal traffic).
 	_, err = client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(cpSGID),
 		IpPermissions: []types.IpPermission{
-			tcpPort(6443, vpcCIDR, "k8s API via NLB"),
-			tcpPort(50000, vpcCIDR, "Talos API via NLB"),
+			tcpPortMultiCIDR(6443, withVPCCIDR(allowed.K8sAPI, vpcCIDR), "k8s API"),
+			tcpPortMultiCIDR(50000, withVPCCIDR(allowed.TalosAPI, vpcCIDR), "Talos API"),
 			tcpPortSG(2379, 2380, cpSGID, "etcd"),
 			allTrafficSG(cpSGID, "intra-CP"),
 			allTrafficSG(wkSGID, "workers-to-CP"),
@@ -308,7 +324,7 @@ func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, cluste
 	_, err = client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(wkSGID),
 		IpPermissions: []types.IpPermission{
-			tcpPort(50000, vpcCIDR, "Talos API via NLB"),
+			tcpPortMultiCIDR(50000, withVPCCIDR(allowed.TalosAPI, vpcCIDR), "Talos API"),
 			allTrafficSG(wkSGID, "intra-worker"),
 			allTrafficSG(cpSGID, "CP-to-workers"),
 		},
@@ -477,6 +493,22 @@ func revokeAllRules(ctx context.Context, client *ec2.Client, sgID string) {
 	}
 }
 
+// firstAvailableAZ returns the name of the first AZ in the region with state "available".
+func firstAvailableAZ(ctx context.Context, client *ec2.Client) (string, error) {
+	out, err := client.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{
+		Filters: []types.Filter{
+			{Name: aws.String("state"), Values: []string{"available"}},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("describe availability zones: %w", err)
+	}
+	if len(out.AvailabilityZones) == 0 {
+		return "", fmt.Errorf("no available AZs found in region")
+	}
+	return aws.ToString(out.AvailabilityZones[0].ZoneName), nil
+}
+
 // --- helpers ---
 
 // clusterResourceTag returns a TagSpecification with Name and k8s-mcp/cluster-id
@@ -488,6 +520,32 @@ func clusterResourceTag(resourceType types.ResourceType, suffix string, ct Clust
 		{Key: aws.String("k8s-mcp/cluster-id"), Value: aws.String(ct.ClusterID)},
 	}
 	return types.TagSpecification{ResourceType: resourceType, Tags: append(tags, extra...)}
+}
+
+// withVPCCIDR returns cidrs with the VPC CIDR appended (deduplicated).
+func withVPCCIDR(cidrs []string, vpcCIDR string) []string {
+	for _, c := range cidrs {
+		if c == vpcCIDR {
+			return cidrs
+		}
+	}
+	return append(cidrs, vpcCIDR)
+}
+
+func tcpPortMultiCIDR(port int32, cidrs []string, description string) types.IpPermission {
+	ranges := make([]types.IpRange, len(cidrs))
+	for i, cidr := range cidrs {
+		ranges[i] = types.IpRange{
+			CidrIp:      aws.String(cidr),
+			Description: aws.String(description),
+		}
+	}
+	return types.IpPermission{
+		IpProtocol: aws.String("tcp"),
+		FromPort:   aws.Int32(port),
+		ToPort:     aws.Int32(port),
+		IpRanges:   ranges,
+	}
 }
 
 func tcpPort(port int32, cidr, description string) types.IpPermission {

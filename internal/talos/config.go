@@ -55,6 +55,7 @@ func GenerateConfigs(in GenerateInput) (*Configs, error) {
 		strings.TrimPrefix(in.KubeVersion, "v"),
 		generate.WithSecretsBundle(secretsBundle),
 		generate.WithVersionContract(vc),
+		generate.WithAdditionalSubjectAltNames([]string{in.ControlPlaneEndpoint}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("build generate input: %w", err)

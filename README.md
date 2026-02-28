@@ -58,6 +58,7 @@ The simplest approach for testing is an IAM user or role with the `AmazonEC2Full
     {
       "Effect": "Allow",
       "Action": [
+        "ec2:DescribeAvailabilityZones",
         "ec2:DescribeImages",
         "ec2:CreateVpc",
         "ec2:ModifyVpcAttribute",
@@ -111,10 +112,15 @@ The simplest approach for testing is an IAM user or role with the `AmazonEC2Full
     },
     {
       "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
       "Action": "iam:CreateServiceLinkedRole",
-      "Resource": "arn:aws:iam::*:role/aws-service-role/elasticloadbalancing.amazonaws.com/AWSServiceRoleForElasticLoadBalancing",
+      "Resource": "*",
       "Condition": {
-        "StringEquals": {
+        "StringLike": {
           "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com"
         }
       }
@@ -412,6 +418,28 @@ aws ec2 get-console-output \
 **Partial resources left after a failed create**
 
 `create` attempts cleanup on failure, but if the process was killed mid-run, orphaned resources may remain. All resources are tagged `k8s-mcp/cluster=<name>` — search by that tag in the AWS console or CLI to find them.
+
+**Debugging with talosctl**
+
+If you have `talosctl` installed, you can inspect the control plane node directly using the generated talosconfig:
+
+```bash
+# Check service status
+talosctl --talosconfig ./<name>-<id>-talosconfig \
+  --endpoints <control-plane-ip> --nodes <control-plane-ip> get services
+
+# View service logs (e.g. etcd, kubelet, apid)
+talosctl --talosconfig ./<name>-<id>-talosconfig \
+  --endpoints <control-plane-ip> --nodes <control-plane-ip> logs etcd
+
+# Check cluster members
+talosctl --talosconfig ./<name>-<id>-talosconfig \
+  --endpoints <control-plane-ip> --nodes <control-plane-ip> get members
+
+# Inspect machine config applied to the node
+talosctl --talosconfig ./<name>-<id>-talosconfig \
+  --endpoints <control-plane-ip> --nodes <control-plane-ip> get machineconfig
+```
 
 **Delete fails due to dependency order**
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"k8s-mcp/internal/cluster"
 	talospkg "k8s-mcp/internal/talos"
@@ -35,15 +36,18 @@ func rootCmd() *cobra.Command {
 
 func createCmd() *cobra.Command {
 	var (
-		name             string
-		region           string
-		talosVersion     string
-		kubeVersion      string
-		workerCount      int
-		controlPlaneType string
-		workerType       string
-		amiID            string
-		stateOut         string
+		name               string
+		region             string
+		talosVersion       string
+		kubeVersion        string
+		workerCount        int
+		controlPlaneType   string
+		workerType         string
+		amiID              string
+		stateOut           string
+		allowedTalosCIDRs  string
+		allowedK8sCIDRs    string
+		allowedIngressCIDRs string
 	)
 
 	cmd := &cobra.Command{
@@ -59,6 +63,15 @@ func createCmd() *cobra.Command {
 			}
 			talosconfigOut := name + "-" + clusterID + "-talosconfig"
 
+			allowedCIDRs := cluster.AllowedCIDRs{
+				TalosAPI: parseCIDRs(allowedTalosCIDRs),
+				K8sAPI:   parseCIDRs(allowedK8sCIDRs),
+				Ingress:  parseCIDRs(allowedIngressCIDRs),
+			}
+			warnOpenCIDRs("--allowed-talos-cidrs", allowedCIDRs.TalosAPI)
+			warnOpenCIDRs("--allowed-k8s-cidrs", allowedCIDRs.K8sAPI)
+			warnOpenCIDRs("--allowed-ingress-cidrs", allowedCIDRs.Ingress)
+
 			cfg := cluster.ClusterConfig{
 				ClusterID:        clusterID,
 				Name:             name,
@@ -69,6 +82,7 @@ func createCmd() *cobra.Command {
 				WorkerType:       workerType,
 				WorkerCount:      workerCount,
 				AMIID:            amiID,
+				AllowedCIDRs:     allowedCIDRs,
 			}
 
 			ctx := context.Background()
@@ -108,13 +122,16 @@ func createCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&name, "name", "", "cluster name (required)")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
-	cmd.Flags().StringVar(&talosVersion, "talos-version", "v1.9.0", "Talos version")
+	cmd.Flags().StringVar(&talosVersion, "talos-version", "v1.12.4", "Talos version")
 	cmd.Flags().StringVar(&kubeVersion, "kube-version", "v1.32.0", "Kubernetes version")
 	cmd.Flags().IntVar(&workerCount, "worker-count", 2, "number of worker nodes")
 	cmd.Flags().StringVar(&controlPlaneType, "control-plane-type", "t3.medium", "EC2 instance type for control plane")
 	cmd.Flags().StringVar(&workerType, "worker-type", "t3.medium", "EC2 instance type for workers")
 	cmd.Flags().StringVar(&amiID, "ami-id", "", "AMI ID to use (skips automatic lookup; required if no official AMI exists for your region/version)")
 	cmd.Flags().StringVar(&stateOut, "state-out", "", "path to write cluster state JSON (default: <name>-state.json)")
+	cmd.Flags().StringVar(&allowedTalosCIDRs, "allowed-talos-cidrs", "0.0.0.0/0", "allowed source CIDRs for Talos API (comma-separated)")
+	cmd.Flags().StringVar(&allowedK8sCIDRs, "allowed-k8s-cidrs", "0.0.0.0/0", "allowed source CIDRs for k8s API (comma-separated)")
+	cmd.Flags().StringVar(&allowedIngressCIDRs, "allowed-ingress-cidrs", "0.0.0.0/0", "allowed source CIDRs for ingress 80/443 (comma-separated)")
 
 	return cmd
 }
@@ -234,6 +251,26 @@ the kubeconfig — retry if the command fails immediately after create.`,
 }
 
 // --- helpers ---
+
+func parseCIDRs(s string) []string {
+	var cidrs []string
+	for _, c := range strings.Split(s, ",") {
+		c = strings.TrimSpace(c)
+		if c != "" {
+			cidrs = append(cidrs, c)
+		}
+	}
+	return cidrs
+}
+
+func warnOpenCIDRs(flag string, cidrs []string) {
+	for _, c := range cidrs {
+		if c == "0.0.0.0/0" {
+			log.Printf("WARNING: %s is open to 0.0.0.0/0 -- consider restricting to specific IPs", flag)
+			return
+		}
+	}
+}
 
 func generateClusterID() string {
 	b := make([]byte, 4)

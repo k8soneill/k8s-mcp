@@ -22,6 +22,12 @@ type Manager struct {
 
 // NewManager creates a Manager for the given AWS region.
 func NewManager(ctx context.Context, region string) (*Manager, error) {
+	id, err := awspkg.GetCallerIdentity(ctx, region)
+	if err != nil {
+		return nil, fmt.Errorf("get caller identity: %w", err)
+	}
+	log.Printf("[aws] running as %s (account %s)", id.ARN, id.Account)
+
 	ec2c, err := awspkg.NewEC2Client(ctx, region)
 	if err != nil {
 		return nil, fmt.Errorf("init EC2 client: %w", err)
@@ -128,6 +134,11 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	log.Printf("[create] creating security groups")
 	state.Config.ControlPlaneSGID, state.Config.WorkerSGID, err = awspkg.CreateSecurityGroups(
 		ctx, m.ec2Client, state.Config.VPCID, cfg.Name, ct,
+		awspkg.SGAllowedCIDRs{
+			TalosAPI: cfg.AllowedCIDRs.TalosAPI,
+			K8sAPI:   cfg.AllowedCIDRs.K8sAPI,
+			Ingress:  cfg.AllowedCIDRs.Ingress,
+		},
 	)
 	if err != nil {
 		cleanup()

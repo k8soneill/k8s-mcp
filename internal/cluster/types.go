@@ -8,13 +8,14 @@ type ClusterConfig struct {
 	ClusterID string `json:"cluster_id"`
 
 	// User-supplied
-	Name             string `json:"name"`
-	Region           string `json:"region"`
-	TalosVersion     string `json:"talos_version"`
-	KubeVersion      string `json:"kube_version"`
-	ControlPlaneType string `json:"control_plane_type"`
-	WorkerType       string `json:"worker_type"`
-	WorkerCount      int    `json:"worker_count"`
+	Name             string       `json:"name"`
+	Region           string       `json:"region"`
+	TalosVersion     string       `json:"talos_version"`
+	KubeVersion      string       `json:"kube_version"`
+	ControlPlaneType string       `json:"control_plane_type"`
+	WorkerType       string       `json:"worker_type"`
+	WorkerCount      int          `json:"worker_count"`
+	AllowedCIDRs     AllowedCIDRs `json:"allowed_cidrs"`
 
 	// Populated during Create — networking
 	AMIID               string   `json:"ami_id"`
@@ -37,6 +38,13 @@ type ClusterConfig struct {
 	// Populated during Create — instances
 	ControlPlaneID      string   `json:"control_plane_id"`
 	WorkerIDs           []string `json:"worker_ids"`
+}
+
+// AllowedCIDRs holds the user-specified source CIDRs for security group ingress rules.
+type AllowedCIDRs struct {
+	TalosAPI []string `json:"talos_api"` // port 50000
+	K8sAPI   []string `json:"k8s_api"`   // port 6443
+	Ingress  []string `json:"ingress"`   // ports 80/443 (future)
 }
 
 // AllInstanceIDs returns all instance IDs (control plane + workers).
