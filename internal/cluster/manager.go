@@ -50,6 +50,11 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	state := &ClusterState{Config: cfg, Status: "creating"}
 	var err error
 
+	ct := awspkg.ClusterTags{
+		ClusterID:  cfg.ClusterID,
+		NamePrefix: cfg.Name + "-" + cfg.ClusterID,
+	}
+
 	save := func() {
 		if progress != nil {
 			progress(state)
@@ -79,7 +84,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	// Must happen before config generation so the address can be baked into
 	// the machine configs. Save immediately — EIP costs start on allocation.
 	log.Printf("[create] allocating Elastic IP")
-	state.Config.EIPID, state.Config.ControlPlaneIP, err = awspkg.AllocateEIP(ctx, m.ec2Client, cfg.Name)
+	state.Config.EIPID, state.Config.ControlPlaneIP, err = awspkg.AllocateEIP(ctx, m.ec2Client, cfg.Name, ct)
 	if err != nil {
 		return nil, nil, fmt.Errorf("allocate EIP: %w", err)
 	}
@@ -101,7 +106,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 
 	// 4. Create VPC, public + private subnets, IGW, NAT GW, route tables.
 	log.Printf("[create] creating VPC networking")
-	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, cfg.Name)
+	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, cfg.Name, ct)
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("create networking: %w", err)
@@ -122,7 +127,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	// 5. Create security groups.
 	log.Printf("[create] creating security groups")
 	state.Config.ControlPlaneSGID, state.Config.WorkerSGID, err = awspkg.CreateSecurityGroups(
-		ctx, m.ec2Client, state.Config.VPCID, cfg.Name,
+		ctx, m.ec2Client, state.Config.VPCID, cfg.Name, ct,
 	)
 	if err != nil {
 		cleanup()
@@ -135,6 +140,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	log.Printf("[create] creating NLB with EIP %s", state.Config.EIPID)
 	nlbIDs, err := awspkg.CreateNLB(ctx, m.elbClient, awspkg.NLBParams{
 		ClusterName:     cfg.Name,
+		Tags:            ct,
 		VPCID:           state.Config.VPCID,
 		PublicSubnetID:  state.Config.PublicSubnetID,
 		EIPAllocationID: state.Config.EIPID,
@@ -153,6 +159,8 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	log.Printf("[create] launching control plane instance")
 	state.Config.ControlPlaneID, err = awspkg.LaunchInstance(ctx, m.ec2Client, awspkg.LaunchParams{
 		ClusterName:  cfg.Name,
+		Tags:         ct,
+		TalosVersion: cfg.TalosVersion,
 		Role:         "controlplane",
 		AMIID:        state.Config.AMIID,
 		InstanceType: cfg.ControlPlaneType,
@@ -191,6 +199,8 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	for i := 0; i < cfg.WorkerCount; i++ {
 		workerID, err := awspkg.LaunchInstance(ctx, m.ec2Client, awspkg.LaunchParams{
 			ClusterName:  cfg.Name,
+			Tags:         ct,
+			TalosVersion: cfg.TalosVersion,
 			Role:         fmt.Sprintf("worker-%d", i),
 			AMIID:        state.Config.AMIID,
 			InstanceType: cfg.WorkerType,

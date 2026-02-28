@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -51,12 +53,14 @@ func createCmd() *cobra.Command {
 			if name == "" {
 				return fmt.Errorf("--name is required")
 			}
+			clusterID := generateClusterID()
 			if stateOut == "" {
-				stateOut = name + "-state.json"
+				stateOut = name + "-" + clusterID + "-state.json"
 			}
-			talosconfigOut := name + "-talosconfig"
+			talosconfigOut := name + "-" + clusterID + "-talosconfig"
 
 			cfg := cluster.ClusterConfig{
+				ClusterID:        clusterID,
 				Name:             name,
 				Region:           region,
 				TalosVersion:     talosVersion,
@@ -183,12 +187,20 @@ the kubeconfig — retry if the command fails immediately after create.`,
 				return fmt.Errorf("read state file: %w", err)
 			}
 
-			// Derive talosconfig path from cluster name if not provided.
+			// Derive talosconfig path from cluster name + ID if not provided.
 			if talosconfigPath == "" {
-				talosconfigPath = state.Config.Name + "-talosconfig"
+				if state.Config.ClusterID != "" {
+					talosconfigPath = state.Config.Name + "-" + state.Config.ClusterID + "-talosconfig"
+				} else {
+					talosconfigPath = state.Config.Name + "-talosconfig"
+				}
 			}
 			if kubeconfigOut == "" {
-				kubeconfigOut = state.Config.Name + "-kubeconfig"
+				if state.Config.ClusterID != "" {
+					kubeconfigOut = state.Config.Name + "-" + state.Config.ClusterID + "-kubeconfig"
+				} else {
+					kubeconfigOut = state.Config.Name + "-kubeconfig"
+				}
 			}
 
 			tc, err := loadTalosconfig(talosconfigPath)
@@ -222,6 +234,12 @@ the kubeconfig — retry if the command fails immediately after create.`,
 }
 
 // --- helpers ---
+
+func generateClusterID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 func writeState(path string, state *cluster.ClusterState) error {
 	b, err := json.MarshalIndent(state, "", "  ")

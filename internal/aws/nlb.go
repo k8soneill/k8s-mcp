@@ -13,9 +13,20 @@ import (
 // NLBParams configures the Network Load Balancer to be created.
 type NLBParams struct {
 	ClusterName     string
+	Tags            ClusterTags
 	VPCID           string
 	PublicSubnetID  string
 	EIPAllocationID string // cluster EIP is pinned to the NLB
+}
+
+// elbTags builds the []elbtypes.Tag slice for ELB resources (NLB, target groups).
+// The ELB SDK uses its own Tag type distinct from the EC2 one.
+func elbTags(suffix string, ct ClusterTags, extra ...elbtypes.Tag) []elbtypes.Tag {
+	tags := []elbtypes.Tag{
+		{Key: aws.String("Name"), Value: aws.String(ct.NamePrefix + "-" + suffix)},
+		{Key: aws.String("k8s-mcp/cluster-id"), Value: aws.String(ct.ClusterID)},
+	}
+	return append(tags, extra...)
 }
 
 // NLBIDs holds the ARNs of the created NLB resources.
@@ -41,9 +52,7 @@ func CreateNLB(ctx context.Context, client *elasticloadbalancingv2.Client, p NLB
 				AllocationId: aws.String(p.EIPAllocationID),
 			},
 		},
-		Tags: []elbtypes.Tag{
-			{Key: aws.String("Name"), Value: aws.String(p.ClusterName + "-nlb")},
-		},
+		Tags: elbTags("nlb", p.Tags),
 	})
 	if err != nil {
 		return ids, fmt.Errorf("create NLB: %w", err)
@@ -67,6 +76,7 @@ func CreateNLB(ctx context.Context, client *elasticloadbalancingv2.Client, p NLB
 		TargetType:          elbtypes.TargetTypeEnumInstance,
 		HealthCheckProtocol: elbtypes.ProtocolEnumTcp,
 		HealthCheckPort:     aws.String("6443"),
+		Tags: elbTags("cp-6443", p.Tags),
 	})
 	if err != nil {
 		return ids, fmt.Errorf("create k8s API target group: %w", err)
@@ -85,6 +95,7 @@ func CreateNLB(ctx context.Context, client *elasticloadbalancingv2.Client, p NLB
 		TargetType:          elbtypes.TargetTypeEnumInstance,
 		HealthCheckProtocol: elbtypes.ProtocolEnumTcp,
 		HealthCheckPort:     aws.String("50000"),
+		Tags: elbTags("talos-50000", p.Tags),
 	})
 	if err != nil {
 		return ids, fmt.Errorf("create Talos API target group: %w", err)

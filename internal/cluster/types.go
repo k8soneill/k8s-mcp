@@ -3,6 +3,10 @@ package cluster
 // ClusterConfig holds the desired configuration for a Talos/k8s cluster on AWS.
 // Fields are progressively populated during Create() as AWS resources are provisioned.
 type ClusterConfig struct {
+	// Generated on create — unique per cluster instance so multiple clusters with
+	// the same name produce distinct state/config files.
+	ClusterID string `json:"cluster_id"`
+
 	// User-supplied
 	Name             string `json:"name"`
 	Region           string `json:"region"`

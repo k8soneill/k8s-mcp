@@ -10,6 +10,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
+// ClusterTags holds tag values applied to all cluster-owned AWS resources.
+// Pass it to every resource-creation function so that tagging is consistent
+// and callers don't have to thread individual tag fields through call sites.
+type ClusterTags struct {
+	ClusterID  string
+	NamePrefix string // "<clusterName>-<clusterID>" — used as the prefix for all resource Name tags
+}
+
 // NetworkIDs holds the resource IDs for all provisioned networking components.
 type NetworkIDs struct {
 	VPCID               string
@@ -38,15 +46,15 @@ type DeleteNetworkingParams struct {
 
 // CreateNetworking provisions a two-subnet VPC (public + private) with an
 // Internet Gateway, a NAT Gateway (for outbound from private instances), and
-// two route tables. All resources are tagged with the cluster name.
-func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName string) (NetworkIDs, error) {
+// two route tables. All resources are tagged with the cluster name and ID.
+func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName string, ct ClusterTags) (NetworkIDs, error) {
 	var ids NetworkIDs
 
 	// --- VPC ---
 	vpcOut, err := client.CreateVpc(ctx, &ec2.CreateVpcInput{
 		CidrBlock: aws.String("10.0.0.0/16"),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeVpc, clusterName+"-vpc"),
+			clusterResourceTag(types.ResourceTypeVpc, "vpc", ct),
 		},
 	})
 	if err != nil {
@@ -73,7 +81,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 		VpcId:     aws.String(ids.VPCID),
 		CidrBlock: aws.String("10.0.1.0/24"),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeSubnet, clusterName+"-public-subnet"),
+			clusterResourceTag(types.ResourceTypeSubnet, "public-subnet", ct),
 		},
 	})
 	if err != nil {
@@ -86,7 +94,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 		VpcId:     aws.String(ids.VPCID),
 		CidrBlock: aws.String("10.0.2.0/24"),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeSubnet, clusterName+"-private-subnet"),
+			clusterResourceTag(types.ResourceTypeSubnet, "private-subnet", ct),
 		},
 	})
 	if err != nil {
@@ -97,7 +105,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 	// --- Internet Gateway ---
 	igwOut, err := client.CreateInternetGateway(ctx, &ec2.CreateInternetGatewayInput{
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeInternetGateway, clusterName+"-igw"),
+			clusterResourceTag(types.ResourceTypeInternetGateway, "igw", ct),
 		},
 	})
 	if err != nil {
@@ -116,7 +124,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 	pubRTOut, err := client.CreateRouteTable(ctx, &ec2.CreateRouteTableInput{
 		VpcId: aws.String(ids.VPCID),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeRouteTable, clusterName+"-public-rt"),
+			clusterResourceTag(types.ResourceTypeRouteTable, "public-rt", ct),
 		},
 	})
 	if err != nil {
@@ -143,7 +151,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 	natEIPOut, err := client.AllocateAddress(ctx, &ec2.AllocateAddressInput{
 		Domain: types.DomainTypeVpc,
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeElasticIp, clusterName+"-nat-eip"),
+			clusterResourceTag(types.ResourceTypeElasticIp, "nat-eip", ct),
 		},
 	})
 	if err != nil {
@@ -157,7 +165,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 		AllocationId:     aws.String(ids.NATGatewayEIPID),
 		ConnectivityType: types.ConnectivityTypePublic,
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeNatgateway, clusterName+"-nat"),
+			clusterResourceTag(types.ResourceTypeNatgateway, "nat", ct),
 		},
 	})
 	if err != nil {
@@ -174,7 +182,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 	privRTOut, err := client.CreateRouteTable(ctx, &ec2.CreateRouteTableInput{
 		VpcId: aws.String(ids.VPCID),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeRouteTable, clusterName+"-private-rt"),
+			clusterResourceTag(types.ResourceTypeRouteTable, "private-rt", ct),
 		},
 	})
 	if err != nil {
@@ -249,7 +257,7 @@ func WaitForNATGatewayDeleted(ctx context.Context, client *ec2.Client, natGWID s
 // originate from within the VPC so this is sufficient while blocking direct
 // internet access to the private instances.
 // Returns (controlPlaneSGID, workerSGID, error).
-func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, clusterName string) (string, string, error) {
+func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, clusterName string, ct ClusterTags) (string, string, error) {
 	const vpcCIDR = "10.0.0.0/16"
 
 	// --- Control plane SG ---
@@ -258,7 +266,7 @@ func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, cluste
 		Description: aws.String("Talos control plane: k8s API + Talos API"),
 		VpcId:       aws.String(vpcID),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeSecurityGroup, clusterName+"-cp-sg"),
+			clusterResourceTag(types.ResourceTypeSecurityGroup, "cp-sg", ct),
 		},
 	})
 	if err != nil {
@@ -272,7 +280,7 @@ func CreateSecurityGroups(ctx context.Context, client *ec2.Client, vpcID, cluste
 		Description: aws.String("Talos workers"),
 		VpcId:       aws.String(vpcID),
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeSecurityGroup, clusterName+"-worker-sg"),
+			clusterResourceTag(types.ResourceTypeSecurityGroup, "worker-sg", ct),
 		},
 	})
 	if err != nil {
@@ -471,13 +479,15 @@ func revokeAllRules(ctx context.Context, client *ec2.Client, sgID string) {
 
 // --- helpers ---
 
-func tag(resourceType types.ResourceType, name string) types.TagSpecification {
-	return types.TagSpecification{
-		ResourceType: resourceType,
-		Tags: []types.Tag{
-			{Key: aws.String("Name"), Value: aws.String(name)},
-		},
+// clusterResourceTag returns a TagSpecification with Name and k8s-mcp/cluster-id
+// tags plus any resource-specific extras. The suffix (e.g. "-vpc") is appended
+// to ct.NamePrefix to form the full Name tag value.
+func clusterResourceTag(resourceType types.ResourceType, suffix string, ct ClusterTags, extra ...types.Tag) types.TagSpecification {
+	tags := []types.Tag{
+		{Key: aws.String("Name"), Value: aws.String(ct.NamePrefix + "-" + suffix)},
+		{Key: aws.String("k8s-mcp/cluster-id"), Value: aws.String(ct.ClusterID)},
 	}
+	return types.TagSpecification{ResourceType: resourceType, Tags: append(tags, extra...)}
 }
 
 func tcpPort(port int32, cidr, description string) types.IpPermission {
