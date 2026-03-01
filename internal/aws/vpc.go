@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -220,7 +221,7 @@ func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName strin
 
 // waitForNATGatewayAvailable polls until the NAT gateway reaches "available" state.
 func waitForNATGatewayAvailable(ctx context.Context, client *ec2.Client, natGWID string) error {
-	deadline := time.Now().Add(3 * time.Minute)
+	deadline := time.Now().Add(10 * time.Minute)
 	for time.Now().Before(deadline) {
 		out, err := client.DescribeNatGateways(ctx, &ec2.DescribeNatGatewaysInput{
 			NatGatewayIds: []string{natGWID},
@@ -237,7 +238,7 @@ func waitForNATGatewayAvailable(ctx context.Context, client *ec2.Client, natGWID
 		case <-time.After(15 * time.Second):
 		}
 	}
-	return fmt.Errorf("NAT gateway %s did not reach available state within 3 minutes", natGWID)
+	return fmt.Errorf("NAT gateway %s did not reach available state within 10 minutes", natGWID)
 }
 
 // WaitForNATGatewayDeleted polls until the NAT gateway reaches "deleted" state.
@@ -401,7 +402,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 			AllocationId: aws.String(p.NATGatewayEIPID),
 		}); err != nil {
 			// Log but continue — failure here won't block VPC deletion.
-			fmt.Printf("[delete] warn: release NAT EIP %s: %v\n", p.NATGatewayEIPID, err)
+			log.Printf("[delete] warn: release NAT EIP %s: %v", p.NATGatewayEIPID, err)
 		}
 	}
 

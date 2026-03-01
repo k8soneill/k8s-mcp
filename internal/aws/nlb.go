@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -42,8 +43,12 @@ type NLBIDs struct {
 func CreateNLB(ctx context.Context, client *elasticloadbalancingv2.Client, p NLBParams) (NLBIDs, error) {
 	var ids NLBIDs
 
+	// NLB/TG names have a 32-char AWS limit. Use "k8s-mcp-<clusterID>-<suffix>"
+	// for uniqueness without depending on the cluster name length.
+	// The full human-readable name is preserved in the Name tag via elbTags().
+	nlbName := "k8s-mcp-" + p.Tags.ClusterID + "-nlb"
 	lbOut, err := client.CreateLoadBalancer(ctx, &elasticloadbalancingv2.CreateLoadBalancerInput{
-		Name:   aws.String(p.ClusterName + "-nlb"),
+		Name:   aws.String(nlbName),
 		Type:   elbtypes.LoadBalancerTypeEnumNetwork,
 		Scheme: elbtypes.LoadBalancerSchemeEnumInternetFacing,
 		SubnetMappings: []elbtypes.SubnetMapping{
@@ -69,7 +74,7 @@ func CreateNLB(ctx context.Context, client *elasticloadbalancingv2.Client, p NLB
 
 	// Target group: k8s API (TCP:6443).
 	cpTGOut, err := client.CreateTargetGroup(ctx, &elasticloadbalancingv2.CreateTargetGroupInput{
-		Name:                aws.String(p.ClusterName + "-cp-6443"),
+		Name:                aws.String("k8s-mcp-" + p.Tags.ClusterID + "-cp-6443"),
 		Protocol:            elbtypes.ProtocolEnumTcp,
 		Port:                aws.Int32(6443),
 		VpcId:               aws.String(p.VPCID),
@@ -88,7 +93,7 @@ func CreateNLB(ctx context.Context, client *elasticloadbalancingv2.Client, p NLB
 
 	// Target group: Talos API (TCP:50000).
 	talosTGOut, err := client.CreateTargetGroup(ctx, &elasticloadbalancingv2.CreateTargetGroupInput{
-		Name:                aws.String(p.ClusterName + "-talos-50000"),
+		Name:                aws.String("k8s-mcp-" + p.Tags.ClusterID + "-talos-50000"),
 		Protocol:            elbtypes.ProtocolEnumTcp,
 		Port:                aws.Int32(50000),
 		VpcId:               aws.String(p.VPCID),
@@ -223,8 +228,12 @@ func waitForNLBDeleted(ctx context.Context, client *elasticloadbalancingv2.Clien
 			LoadBalancerArns: []string{arn},
 		})
 		if err != nil {
-			// ResourceNotFoundException means it's fully gone.
-			return nil
+			// LoadBalancerNotFoundException means it's fully gone.
+			var lbNotFound *elbtypes.LoadBalancerNotFoundException
+			if errors.As(err, &lbNotFound) {
+				return nil
+			}
+			return fmt.Errorf("describe NLB: %w", err)
 		}
 		if len(out.LoadBalancers) == 0 {
 			return nil
@@ -237,3 +246,4 @@ func waitForNLBDeleted(ctx context.Context, client *elasticloadbalancingv2.Clien
 	}
 	return fmt.Errorf("NLB %s did not reach deleted state within 5 minutes", arn)
 }
+

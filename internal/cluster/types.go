@@ -1,5 +1,10 @@
 package cluster
 
+// MaxClusterNameLength is the maximum allowed length for a cluster name.
+// AWS Name tags allow 256 chars and SG GroupName allows 255 chars; 63 aligns
+// with the Kubernetes label-value and DNS-label limits.
+const MaxClusterNameLength = 63
+
 // ClusterConfig holds the desired configuration for a Talos/k8s cluster on AWS.
 // Fields are progressively populated during Create() as AWS resources are provisioned.
 type ClusterConfig struct {

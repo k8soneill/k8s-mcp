@@ -51,7 +51,14 @@ type ProgressFunc func(state *ClusterState)
 // progress is called after each significant resource is created; pass nil to skip.
 // If any step fails, it attempts a best-effort cleanup of already-created resources.
 func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress ProgressFunc) (*ClusterState, *clientconfig.Config, error) {
-	log.Printf("[create] starting cluster %q in %s", cfg.Name, cfg.Region)
+	if cfg.ClusterID == "" {
+		return nil, nil, fmt.Errorf("ClusterID is required")
+	}
+	if len(cfg.Name) > MaxClusterNameLength {
+		return nil, nil, fmt.Errorf("cluster name %q exceeds %d character limit", cfg.Name, MaxClusterNameLength)
+	}
+
+	log.Printf("[create] starting cluster %q (%s) in %s", cfg.Name, cfg.ClusterID, cfg.Region)
 
 	state := &ClusterState{Config: cfg, Status: "creating"}
 	var err error

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"strings"
 
@@ -57,16 +58,34 @@ func createCmd() *cobra.Command {
 			if name == "" {
 				return fmt.Errorf("--name is required")
 			}
-			clusterID := generateClusterID()
+			if len(name) > cluster.MaxClusterNameLength {
+				return fmt.Errorf("--name %q exceeds %d character limit", name, cluster.MaxClusterNameLength)
+			}
+			clusterID, err := generateClusterID()
+			if err != nil {
+				return err
+			}
 			if stateOut == "" {
 				stateOut = name + "-" + clusterID + "-state.json"
 			}
 			talosconfigOut := name + "-" + clusterID + "-talosconfig"
 
+			talosCIDRs, err := parseCIDRs(allowedTalosCIDRs)
+			if err != nil {
+				return fmt.Errorf("--allowed-talos-cidrs: %w", err)
+			}
+			k8sCIDRs, err := parseCIDRs(allowedK8sCIDRs)
+			if err != nil {
+				return fmt.Errorf("--allowed-k8s-cidrs: %w", err)
+			}
+			ingressCIDRs, err := parseCIDRs(allowedIngressCIDRs)
+			if err != nil {
+				return fmt.Errorf("--allowed-ingress-cidrs: %w", err)
+			}
 			allowedCIDRs := cluster.AllowedCIDRs{
-				TalosAPI: parseCIDRs(allowedTalosCIDRs),
-				K8sAPI:   parseCIDRs(allowedK8sCIDRs),
-				Ingress:  parseCIDRs(allowedIngressCIDRs),
+				TalosAPI: talosCIDRs,
+				K8sAPI:   k8sCIDRs,
+				Ingress:  ingressCIDRs,
 			}
 			warnOpenCIDRs("--allowed-talos-cidrs", allowedCIDRs.TalosAPI)
 			warnOpenCIDRs("--allowed-k8s-cidrs", allowedCIDRs.K8sAPI)
@@ -252,15 +271,19 @@ the kubeconfig — retry if the command fails immediately after create.`,
 
 // --- helpers ---
 
-func parseCIDRs(s string) []string {
+func parseCIDRs(s string) ([]string, error) {
 	var cidrs []string
 	for _, c := range strings.Split(s, ",") {
 		c = strings.TrimSpace(c)
-		if c != "" {
-			cidrs = append(cidrs, c)
+		if c == "" {
+			continue
 		}
+		if _, err := netip.ParsePrefix(c); err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", c, err)
+		}
+		cidrs = append(cidrs, c)
 	}
-	return cidrs
+	return cidrs, nil
 }
 
 func warnOpenCIDRs(flag string, cidrs []string) {
@@ -272,10 +295,12 @@ func warnOpenCIDRs(flag string, cidrs []string) {
 	}
 }
 
-func generateClusterID() string {
+func generateClusterID() (string, error) {
 	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate cluster ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func writeState(path string, state *cluster.ClusterState) error {
