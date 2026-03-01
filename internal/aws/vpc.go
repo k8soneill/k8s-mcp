@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 )
 
 // ClusterTags holds tag values applied to all cluster-owned AWS resources.
@@ -249,6 +251,9 @@ func WaitForNATGatewayDeleted(ctx context.Context, client *ec2.Client, natGWID s
 			NatGatewayIds: []string{natGWID},
 		})
 		if err != nil {
+			if isEC2NotFound(err) {
+				return nil
+			}
 			return fmt.Errorf("describe NAT gateway: %w", err)
 		}
 		if len(out.NatGateways) == 0 || out.NatGateways[0].State == types.NatGatewayStateDeleted {
@@ -352,14 +357,14 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 	if p.WorkerSGID != "" {
 		if _, err := client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
 			GroupId: aws.String(p.WorkerSGID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete worker SG: %w", err)
 		}
 	}
 	if p.CPSGID != "" {
 		if _, err := client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
 			GroupId: aws.String(p.CPSGID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete CP SG: %w", err)
 		}
 	}
@@ -369,7 +374,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 		disassociateRouteTable(ctx, client, p.PrivateRouteTableID)
 		if _, err := client.DeleteRouteTable(ctx, &ec2.DeleteRouteTableInput{
 			RouteTableId: aws.String(p.PrivateRouteTableID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete private route table: %w", err)
 		}
 	}
@@ -379,7 +384,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 		disassociateRouteTable(ctx, client, p.PublicRouteTableID)
 		if _, err := client.DeleteRouteTable(ctx, &ec2.DeleteRouteTableInput{
 			RouteTableId: aws.String(p.PublicRouteTableID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete public route table: %w", err)
 		}
 	}
@@ -389,7 +394,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 	if p.NATGatewayID != "" {
 		if _, err := client.DeleteNatGateway(ctx, &ec2.DeleteNatGatewayInput{
 			NatGatewayId: aws.String(p.NATGatewayID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete NAT gateway: %w", err)
 		}
 		if err := WaitForNATGatewayDeleted(ctx, client, p.NATGatewayID); err != nil {
@@ -400,7 +405,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 	if p.NATGatewayEIPID != "" {
 		if _, err := client.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
 			AllocationId: aws.String(p.NATGatewayEIPID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			// Log but continue — failure here won't block VPC deletion.
 			log.Printf("[delete] warn: release NAT EIP %s: %v", p.NATGatewayEIPID, err)
 		}
@@ -410,7 +415,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 	if p.PrivateSubnetID != "" {
 		if _, err := client.DeleteSubnet(ctx, &ec2.DeleteSubnetInput{
 			SubnetId: aws.String(p.PrivateSubnetID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete private subnet: %w", err)
 		}
 	}
@@ -419,7 +424,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 	if p.PublicSubnetID != "" {
 		if _, err := client.DeleteSubnet(ctx, &ec2.DeleteSubnetInput{
 			SubnetId: aws.String(p.PublicSubnetID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete public subnet: %w", err)
 		}
 	}
@@ -432,7 +437,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 		})
 		if _, err := client.DeleteInternetGateway(ctx, &ec2.DeleteInternetGatewayInput{
 			InternetGatewayId: aws.String(p.IGWID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete internet gateway: %w", err)
 		}
 	}
@@ -441,7 +446,7 @@ func DeleteNetworking(ctx context.Context, client *ec2.Client, p DeleteNetworkin
 	if p.VPCID != "" {
 		if _, err := client.DeleteVpc(ctx, &ec2.DeleteVpcInput{
 			VpcId: aws.String(p.VPCID),
-		}); err != nil {
+		}); err != nil && !isEC2NotFound(err) {
 			return fmt.Errorf("delete VPC: %w", err)
 		}
 	}
@@ -508,6 +513,29 @@ func firstAvailableAZ(ctx context.Context, client *ec2.Client) (string, error) {
 		return "", fmt.Errorf("no available AZs found in region")
 	}
 	return aws.ToString(out.AvailabilityZones[0].ZoneName), nil
+}
+
+// isEC2NotFound returns true if the error is an AWS API error indicating the
+// resource does not exist. This covers all the "not found" codes returned by
+// EC2 delete/describe operations (e.g. InvalidGroup.NotFound, InvalidVpcID.NotFound).
+func isEC2NotFound(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "InvalidGroup.NotFound",
+		"InvalidRouteTableID.NotFound", "InvalidRouteTableId.NotFound",
+		"InvalidSubnetID.NotFound", "InvalidSubnetId.NotFound",
+		"InvalidInternetGatewayID.NotFound",
+		"InvalidVpcID.NotFound", "InvalidVpcId.NotFound",
+		"InvalidNatGatewayID.NotFound",
+		"InvalidAllocationID.NotFound", "InvalidAllocationId.NotFound",
+		"InvalidAddress.NotFound",
+		"NatGatewayNotFound":
+		return true
+	}
+	return false
 }
 
 // --- helpers ---

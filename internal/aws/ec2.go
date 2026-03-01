@@ -5,12 +5,15 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 )
 
 // LaunchParams configures a single EC2 instance launch.
@@ -54,15 +57,40 @@ func AssociateEIP(ctx context.Context, client *ec2.Client, allocationID, instanc
 	return nil
 }
 
-// ReleaseEIP releases an Elastic IP allocation.
+// ReleaseEIP releases an Elastic IP allocation. It is idempotent: if the EIP
+// is already released it returns nil. If the EIP is still held by a
+// recently-deleted NLB, it retries for up to 3 minutes.
 func ReleaseEIP(ctx context.Context, client *ec2.Client, allocationID string) error {
-	_, err := client.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
-		AllocationId: aws.String(allocationID),
-	})
-	if err != nil {
+	const maxAttempts = 12
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		_, err := client.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
+			AllocationId: aws.String(allocationID),
+		})
+		if err == nil {
+			return nil
+		}
+
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "InvalidAllocationID.NotFound", "InvalidAllocationId.NotFound",
+				"InvalidAddress.NotFound":
+				return nil // already released
+			case "AuthFailure", "InvalidAddressID.NotFound":
+				// EIP still held by a recently-deleted NLB — retry.
+				log.Printf("[delete] EIP %s still in use, retrying (%d/%d)", allocationID, attempt+1, maxAttempts)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+				continue
+			}
+		}
+
 		return fmt.Errorf("release EIP %s: %w", allocationID, err)
 	}
-	return nil
+	return fmt.Errorf("release EIP %s: still in use after %d attempts", allocationID, maxAttempts)
 }
 
 // gzipBase64 gzip-compresses data and returns the base64-encoded result.
@@ -145,7 +173,8 @@ func WaitForInstanceRunning(ctx context.Context, client *ec2.Client, instanceID 
 }
 
 // TerminateInstances terminates the given instances and waits for them to reach
-// the "terminated" state (up to 15 minutes).
+// the "terminated" state (up to 15 minutes). It is idempotent: instances that
+// no longer exist are silently skipped.
 func TerminateInstances(ctx context.Context, client *ec2.Client, instanceIDs []string) error {
 	if len(instanceIDs) == 0 {
 		return nil
@@ -155,6 +184,10 @@ func TerminateInstances(ctx context.Context, client *ec2.Client, instanceIDs []s
 		InstanceIds: instanceIDs,
 	})
 	if err != nil {
+		// If all instances are already gone, nothing to do.
+		if isEC2NotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("terminate instances: %w", err)
 	}
 
@@ -169,6 +202,10 @@ func TerminateInstances(ctx context.Context, client *ec2.Client, instanceIDs []s
 			InstanceIds: instanceIDs,
 		})
 		if err != nil {
+			// Instances may have been fully purged from the API.
+			if isEC2NotFound(err) {
+				return nil
+			}
 			return fmt.Errorf("describe instances while waiting for termination: %w", err)
 		}
 		for _, r := range out.Reservations {
