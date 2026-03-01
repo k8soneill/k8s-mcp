@@ -180,7 +180,7 @@ The `create` command writes a JSON state file after every significant resource a
 {
   config: {
     // generated on create
-    cluster_id,               // 8-char random hex — unique per cluster instance
+    cluster_id,               // 10-char random hex — unique per cluster instance
 
     // user-supplied
     name, region, talos_version, kube_version,

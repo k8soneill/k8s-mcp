@@ -124,10 +124,8 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	// 4. Create VPC, public + private subnets, IGW, NAT GW, route tables.
 	log.Printf("[create] creating VPC networking")
 	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, ct)
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("create networking: %w", err)
-	}
+	// Copy partial IDs into state BEFORE checking err so cleanup() can
+	// tear down whatever was created if the function failed mid-way.
 	state.Config.VPCID = netIDs.VPCID
 	state.Config.PublicSubnetID = netIDs.PublicSubnetID
 	state.Config.SubnetID = netIDs.PrivateSubnetID // instances go in the private subnet
@@ -136,10 +134,14 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	state.Config.PrivateRouteTableID = netIDs.PrivateRouteTableID
 	state.Config.NATGatewayID = netIDs.NATGatewayID
 	state.Config.NATGatewayEIPID = netIDs.NATGatewayEIPID
+	save()
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("create networking: %w", err)
+	}
 	log.Printf("[create] VPC: %s, public subnet: %s, private subnet: %s, NAT GW: %s",
 		state.Config.VPCID, state.Config.PublicSubnetID,
 		state.Config.SubnetID, state.Config.NATGatewayID)
-	save()
 
 	// 5. Create security groups.
 	log.Printf("[create] creating security groups")
@@ -166,15 +168,17 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 		PublicSubnetID:  state.Config.PublicSubnetID,
 		EIPAllocationID: state.Config.EIPID,
 	})
+	// Copy partial IDs into state BEFORE checking err so cleanup() can
+	// delete the NLB/TGs if the function failed after creating some of them.
+	state.Config.NLBARN = nlbIDs.NLBARN
+	state.Config.CPTargetGroupARN = nlbIDs.CPTargetGroupARN
+	state.Config.TalosTargetGroupARN = nlbIDs.TalosTargetGroupARN
+	save()
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("create NLB: %w", err)
 	}
-	state.Config.NLBARN = nlbIDs.NLBARN
-	state.Config.CPTargetGroupARN = nlbIDs.CPTargetGroupARN
-	state.Config.TalosTargetGroupARN = nlbIDs.TalosTargetGroupARN
 	log.Printf("[create] NLB: %s", state.Config.NLBARN)
-	save()
 
 	// 7. Launch control plane instance (into the private subnet — no public IP).
 	log.Printf("[create] launching control plane instance")
