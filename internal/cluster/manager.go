@@ -21,12 +21,16 @@ type Manager struct {
 }
 
 // NewManager creates a Manager for the given AWS region.
-func NewManager(ctx context.Context, region string) (*Manager, error) {
-	id, err := awspkg.GetCallerIdentity(ctx, region)
-	if err != nil {
-		return nil, fmt.Errorf("get caller identity: %w", err)
+// When debug is true, it logs the AWS caller identity (requires sts:GetCallerIdentity).
+func NewManager(ctx context.Context, region string, debug bool) (*Manager, error) {
+	if debug {
+		id, err := awspkg.GetCallerIdentity(ctx, region)
+		if err != nil {
+			log.Printf("[aws] warn: could not get caller identity: %v", err)
+		} else {
+			log.Printf("[aws] running as %s (account %s)", id.ARN, id.Account)
+		}
 	}
-	log.Printf("[aws] running as %s (account %s)", id.ARN, id.Account)
 
 	ec2c, err := awspkg.NewEC2Client(ctx, region)
 	if err != nil {
@@ -97,7 +101,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	// Must happen before config generation so the address can be baked into
 	// the machine configs. Save immediately — EIP costs start on allocation.
 	log.Printf("[create] allocating Elastic IP")
-	state.Config.EIPID, state.Config.ControlPlaneIP, err = awspkg.AllocateEIP(ctx, m.ec2Client, cfg.Name, ct)
+	state.Config.EIPID, state.Config.ControlPlaneIP, err = awspkg.AllocateEIP(ctx, m.ec2Client, ct)
 	if err != nil {
 		return nil, nil, fmt.Errorf("allocate EIP: %w", err)
 	}
@@ -119,7 +123,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 
 	// 4. Create VPC, public + private subnets, IGW, NAT GW, route tables.
 	log.Printf("[create] creating VPC networking")
-	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, cfg.Name, ct)
+	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, ct)
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("create networking: %w", err)
@@ -157,7 +161,6 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	// This is what the Talos and k8s configs point to as the control plane endpoint.
 	log.Printf("[create] creating NLB with EIP %s", state.Config.EIPID)
 	nlbIDs, err := awspkg.CreateNLB(ctx, m.elbClient, awspkg.NLBParams{
-		ClusterName:     cfg.Name,
 		Tags:            ct,
 		VPCID:           state.Config.VPCID,
 		PublicSubnetID:  state.Config.PublicSubnetID,

@@ -115,7 +115,8 @@ The simplest approach for testing is an IAM user or role with the `AmazonEC2Full
     {
       "Effect": "Allow",
       "Action": "sts:GetCallerIdentity",
-      "Resource": "*"
+      "Resource": "*",
+      "Sid": "OnlyNeededWithDebugFlag"
     },
     {
       "Effect": "Allow",
@@ -135,7 +136,7 @@ If you are importing a custom Talos AMI (see below), also add `ec2:ImportSnapsho
 
 #### 2. Elastic IP quota
 
-Each cluster uses one Elastic IP. The default AWS quota is 5 EIPs per region. Check your current allocation:
+Each cluster uses two Elastic IPs (one for the NLB, one for the NAT Gateway). The default AWS quota is 5 EIPs per region. Check your current allocation:
 
 ```bash
 aws ec2 describe-addresses --query 'Addresses[*].PublicIp'
@@ -345,7 +346,7 @@ go run ./cmd/cluster create \
 ### Delete a cluster
 
 ```bash
-go run ./cmd/cluster delete --state ./my-cluster-state.json
+go run ./cmd/cluster delete --state ./my-cluster-<clusterID>-state.json
 ```
 
 The state file records all AWS resource IDs created during `create`. Delete uses this to tear down resources in safe order: instances → NLB + target groups → cluster EIP → security groups → NAT Gateway + its EIP → subnets → IGW → VPC.
@@ -361,22 +362,35 @@ Deletion is idempotent — resources that no longer exist are silently skipped.
 ```json
 {
   "config": {
+    "cluster_id": "3aa4cc10ab",
     "name": "my-cluster",
     "region": "us-east-1",
-    "talos_version": "v1.9.0",
+    "talos_version": "v1.12.4",
     "kube_version": "v1.32.0",
     "control_plane_type": "t3.medium",
     "worker_type": "t3.medium",
     "worker_count": 2,
+    "allowed_cidrs": {
+      "talos_api": ["0.0.0.0/0"],
+      "k8s_api": ["0.0.0.0/0"],
+      "ingress": ["0.0.0.0/0"]
+    },
     "ami_id": "ami-041649a9ff39ab1cd",
     "vpc_id": "vpc-0abc...",
-    "subnet_id": "subnet-0abc...",
+    "public_subnet_id": "subnet-0pub...",
+    "subnet_id": "subnet-0priv...",
     "igw_id": "igw-0abc...",
-    "route_table_id": "rtb-0abc...",
+    "route_table_id": "rtb-0pub...",
+    "private_route_table_id": "rtb-0priv...",
+    "nat_gateway_id": "nat-0abc...",
+    "nat_gateway_eip_id": "eipalloc-0nat...",
     "control_plane_sg_id": "sg-0abc...",
     "worker_sg_id": "sg-0xyz...",
     "eip_id": "eipalloc-0abc...",
     "control_plane_ip": "1.2.3.4",
+    "nlb_arn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/net/...",
+    "cp_target_group_arn": "arn:aws:elasticloadbalancing:...:targetgroup/...",
+    "talos_target_group_arn": "arn:aws:elasticloadbalancing:...:targetgroup/...",
     "control_plane_id": "i-0abc...",
     "worker_ids": ["i-0def...", "i-0ghi..."]
   },

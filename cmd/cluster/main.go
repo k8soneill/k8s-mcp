@@ -29,6 +29,7 @@ func rootCmd() *cobra.Command {
 		Use:   "cluster",
 		Short: "Provision and destroy Talos/k8s clusters on AWS",
 	}
+	root.PersistentFlags().Bool("debug", false, "enable debug logging (e.g. print AWS caller identity)")
 	root.AddCommand(createCmd(), deleteCmd(), kubeconfigCmd())
 	return root
 }
@@ -105,7 +106,8 @@ func createCmd() *cobra.Command {
 			}
 
 			ctx := context.Background()
-			mgr, err := cluster.NewManager(ctx, region)
+			debug, _ := cmd.Flags().GetBool("debug")
+			mgr, err := cluster.NewManager(ctx, region, debug)
 			if err != nil {
 				return fmt.Errorf("init manager: %w", err)
 			}
@@ -147,7 +149,7 @@ func createCmd() *cobra.Command {
 	cmd.Flags().StringVar(&controlPlaneType, "control-plane-type", "t3.medium", "EC2 instance type for control plane")
 	cmd.Flags().StringVar(&workerType, "worker-type", "t3.medium", "EC2 instance type for workers")
 	cmd.Flags().StringVar(&amiID, "ami-id", "", "AMI ID to use (skips automatic lookup; required if no official AMI exists for your region/version)")
-	cmd.Flags().StringVar(&stateOut, "state-out", "", "path to write cluster state JSON (default: <name>-state.json)")
+	cmd.Flags().StringVar(&stateOut, "state-out", "", "path to write cluster state JSON (default: <name>-<clusterID>-state.json)")
 	cmd.Flags().StringVar(&allowedTalosCIDRs, "allowed-talos-cidrs", "0.0.0.0/0", "allowed source CIDRs for Talos API (comma-separated)")
 	cmd.Flags().StringVar(&allowedK8sCIDRs, "allowed-k8s-cidrs", "0.0.0.0/0", "allowed source CIDRs for k8s API (comma-separated)")
 	cmd.Flags().StringVar(&allowedIngressCIDRs, "allowed-ingress-cidrs", "0.0.0.0/0", "allowed source CIDRs for ingress 80/443 (comma-separated)")
@@ -174,7 +176,8 @@ func deleteCmd() *cobra.Command {
 			}
 
 			ctx := context.Background()
-			mgr, err := cluster.NewManager(ctx, state.Config.Region)
+			debug, _ := cmd.Flags().GetBool("debug")
+			mgr, err := cluster.NewManager(ctx, state.Config.Region, debug)
 			if err != nil {
 				return fmt.Errorf("init manager: %w", err)
 			}
@@ -296,7 +299,7 @@ func warnOpenCIDRs(flag string, cidrs []string) {
 }
 
 func generateClusterID() (string, error) {
-	b := make([]byte, 4)
+	b := make([]byte, 5)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate cluster ID: %w", err)
 	}

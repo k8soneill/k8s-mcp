@@ -48,7 +48,7 @@ type DeleteNetworkingParams struct {
 // CreateNetworking provisions a two-subnet VPC (public + private) with an
 // Internet Gateway, a NAT Gateway (for outbound from private instances), and
 // two route tables. All resources are tagged with the cluster name and ID.
-func CreateNetworking(ctx context.Context, client *ec2.Client, clusterName string, ct ClusterTags) (NetworkIDs, error) {
+func CreateNetworking(ctx context.Context, client *ec2.Client, ct ClusterTags) (NetworkIDs, error) {
 	var ids NetworkIDs
 
 	// Pick the first available AZ in the region so both subnets are co-located.

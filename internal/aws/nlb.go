@@ -13,7 +13,6 @@ import (
 
 // NLBParams configures the Network Load Balancer to be created.
 type NLBParams struct {
-	ClusterName     string
 	Tags            ClusterTags
 	VPCID           string
 	PublicSubnetID  string

@@ -29,7 +29,7 @@ type LaunchParams struct {
 }
 
 // AllocateEIP allocates a VPC-domain Elastic IP and returns (allocationID, publicIP).
-func AllocateEIP(ctx context.Context, client *ec2.Client, clusterName string, ct ClusterTags) (string, string, error) {
+func AllocateEIP(ctx context.Context, client *ec2.Client, ct ClusterTags) (string, string, error) {
 	out, err := client.AllocateAddress(ctx, &ec2.AllocateAddressInput{
 		Domain: types.DomainTypeVpc,
 		TagSpecifications: []types.TagSpecification{
