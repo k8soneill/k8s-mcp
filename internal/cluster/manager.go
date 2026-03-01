@@ -301,13 +301,12 @@ func (m *Manager) Delete(ctx context.Context, state *ClusterState) error {
 
 	// 3. Release the cluster Elastic IP (was held by the NLB).
 	// ReleaseEIP retries internally if the EIP is still associated with a
-	// recently-deleted NLB. Non-fatal so networking cleanup still runs.
-	var eipErr error
+	// recently-deleted NLB. Non-fatal so networking cleanup still runs;
+	// a leaked EIP is logged as a warning, not a teardown failure.
 	if cfg.EIPID != "" {
 		log.Printf("[delete] releasing EIP %s", cfg.EIPID)
 		if err := awspkg.ReleaseEIP(ctx, m.ec2Client, cfg.EIPID); err != nil {
-			log.Printf("[delete] warn: release EIP: %v", err)
-			eipErr = fmt.Errorf("release EIP: %w", err)
+			log.Printf("[delete] warn: %v (EIP may need manual cleanup)", err)
 		}
 	}
 
@@ -332,5 +331,5 @@ func (m *Manager) Delete(ctx context.Context, state *ClusterState) error {
 
 	state.Status = "deleted"
 	log.Printf("[delete] cluster %q deleted", cfg.Name)
-	return eipErr
+	return nil
 }
