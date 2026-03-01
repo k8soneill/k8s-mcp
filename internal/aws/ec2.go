@@ -16,6 +16,8 @@ import (
 // LaunchParams configures a single EC2 instance launch.
 type LaunchParams struct {
 	ClusterName  string
+	Tags         ClusterTags
+	TalosVersion string
 	Role         string // "controlplane" | "worker"
 	AMIID        string
 	InstanceType string
@@ -27,11 +29,11 @@ type LaunchParams struct {
 }
 
 // AllocateEIP allocates a VPC-domain Elastic IP and returns (allocationID, publicIP).
-func AllocateEIP(ctx context.Context, client *ec2.Client, clusterName string) (string, string, error) {
+func AllocateEIP(ctx context.Context, client *ec2.Client, ct ClusterTags) (string, string, error) {
 	out, err := client.AllocateAddress(ctx, &ec2.AllocateAddressInput{
 		Domain: types.DomainTypeVpc,
 		TagSpecifications: []types.TagSpecification{
-			tag(types.ResourceTypeElasticIp, clusterName+"-eip"),
+			clusterResourceTag(types.ResourceTypeElasticIp, "eip", ct),
 		},
 	})
 	if err != nil {
@@ -98,14 +100,10 @@ func LaunchInstance(ctx context.Context, client *ec2.Client, p LaunchParams) (st
 		SecurityGroupIds: []string{p.SGID},
 		UserData:     aws.String(encodedUserData),
 		TagSpecifications: []types.TagSpecification{
-			{
-				ResourceType: types.ResourceTypeInstance,
-				Tags: []types.Tag{
-					{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("%s-%s", p.ClusterName, p.Role))},
-					{Key: aws.String("k8s-mcp/cluster"), Value: aws.String(p.ClusterName)},
-					{Key: aws.String("k8s-mcp/role"), Value: aws.String(p.Role)},
-				},
-			},
+			clusterResourceTag(types.ResourceTypeInstance, p.Role, p.Tags,
+				types.Tag{Key: aws.String("k8s-mcp/role"), Value: aws.String(p.Role)},
+				types.Tag{Key: aws.String("k8s-mcp/talos-version"), Value: aws.String(p.TalosVersion)},
+			),
 		},
 		// Disable accidental termination protection isn't set here intentionally —
 		// the delete path will handle teardown explicitly.

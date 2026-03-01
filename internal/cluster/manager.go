@@ -9,22 +9,38 @@ import (
 	talospkg "k8s-mcp/internal/talos"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 )
 
 // Manager orchestrates cluster create and delete operations.
 type Manager struct {
 	ec2Client *ec2.Client
+	elbClient *elasticloadbalancingv2.Client
 	region    string
 }
 
 // NewManager creates a Manager for the given AWS region.
-func NewManager(ctx context.Context, region string) (*Manager, error) {
-	c, err := awspkg.NewEC2Client(ctx, region)
-	if err != nil {
-		return nil, fmt.Errorf("init manager: %w", err)
+// When debug is true, it logs the AWS caller identity (requires sts:GetCallerIdentity).
+func NewManager(ctx context.Context, region string, debug bool) (*Manager, error) {
+	if debug {
+		id, err := awspkg.GetCallerIdentity(ctx, region)
+		if err != nil {
+			log.Printf("[aws] warn: could not get caller identity: %v", err)
+		} else {
+			log.Printf("[aws] running as %s (account %s)", id.ARN, id.Account)
+		}
 	}
-	return &Manager{ec2Client: c, region: region}, nil
+
+	ec2c, err := awspkg.NewEC2Client(ctx, region)
+	if err != nil {
+		return nil, fmt.Errorf("init EC2 client: %w", err)
+	}
+	elbc, err := awspkg.NewELBv2Client(ctx, region)
+	if err != nil {
+		return nil, fmt.Errorf("init ELBv2 client: %w", err)
+	}
+	return &Manager{ec2Client: ec2c, elbClient: elbc, region: region}, nil
 }
 
 // ProgressFunc is called after each resource allocation step during Create so
@@ -39,10 +55,22 @@ type ProgressFunc func(state *ClusterState)
 // progress is called after each significant resource is created; pass nil to skip.
 // If any step fails, it attempts a best-effort cleanup of already-created resources.
 func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress ProgressFunc) (*ClusterState, *clientconfig.Config, error) {
-	log.Printf("[create] starting cluster %q in %s", cfg.Name, cfg.Region)
+	if cfg.ClusterID == "" {
+		return nil, nil, fmt.Errorf("ClusterID is required")
+	}
+	if len(cfg.Name) > MaxClusterNameLength {
+		return nil, nil, fmt.Errorf("cluster name %q exceeds %d character limit", cfg.Name, MaxClusterNameLength)
+	}
+
+	log.Printf("[create] starting cluster %q (%s) in %s", cfg.Name, cfg.ClusterID, cfg.Region)
 
 	state := &ClusterState{Config: cfg, Status: "creating"}
 	var err error
+
+	ct := awspkg.ClusterTags{
+		ClusterID:  cfg.ClusterID,
+		NamePrefix: cfg.Name + "-" + cfg.ClusterID,
+	}
 
 	save := func() {
 		if progress != nil {
@@ -55,7 +83,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 		if cleanErr := m.Delete(ctx, state); cleanErr != nil {
 			log.Printf("[create] cleanup error (resources may be orphaned): %v", cleanErr)
 		}
-		save() // persist final status ("deleted" or "deleting" if cleanup failed)
+		save() // persist final status
 	}
 
 	// 1. Find the Talos AMI.
@@ -69,11 +97,11 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	state.Config.AMIID = cfg.AMIID
 	log.Printf("[create] AMI: %s", state.Config.AMIID)
 
-	// 2. Allocate an Elastic IP.
-	// Must happen before config generation so the address can be baked into machine configs.
-	// Save immediately — EIP starts accruing cost as soon as it is allocated.
+	// 2. Allocate an Elastic IP for the NLB.
+	// Must happen before config generation so the address can be baked into
+	// the machine configs. Save immediately — EIP costs start on allocation.
 	log.Printf("[create] allocating Elastic IP")
-	state.Config.EIPID, state.Config.ControlPlaneIP, err = awspkg.AllocateEIP(ctx, m.ec2Client, cfg.Name)
+	state.Config.EIPID, state.Config.ControlPlaneIP, err = awspkg.AllocateEIP(ctx, m.ec2Client, ct)
 	if err != nil {
 		return nil, nil, fmt.Errorf("allocate EIP: %w", err)
 	}
@@ -93,24 +121,37 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 		return nil, nil, fmt.Errorf("generate Talos configs: %w", err)
 	}
 
-	// 4. Create VPC, subnet, IGW, route table.
+	// 4. Create VPC, public + private subnets, IGW, NAT GW, route tables.
 	log.Printf("[create] creating VPC networking")
-	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, cfg.Name)
+	netIDs, err := awspkg.CreateNetworking(ctx, m.ec2Client, ct)
+	// Copy partial IDs into state BEFORE checking err so cleanup() can
+	// tear down whatever was created if the function failed mid-way.
+	state.Config.VPCID = netIDs.VPCID
+	state.Config.PublicSubnetID = netIDs.PublicSubnetID
+	state.Config.SubnetID = netIDs.PrivateSubnetID // instances go in the private subnet
+	state.Config.IGWID = netIDs.IGWID
+	state.Config.RouteTableID = netIDs.PublicRouteTableID
+	state.Config.PrivateRouteTableID = netIDs.PrivateRouteTableID
+	state.Config.NATGatewayID = netIDs.NATGatewayID
+	state.Config.NATGatewayEIPID = netIDs.NATGatewayEIPID
+	save()
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("create networking: %w", err)
 	}
-	state.Config.VPCID = netIDs.VPCID
-	state.Config.SubnetID = netIDs.SubnetID
-	state.Config.IGWID = netIDs.IGWID
-	state.Config.RouteTableID = netIDs.RouteTableID
-	log.Printf("[create] VPC: %s, subnet: %s", state.Config.VPCID, state.Config.SubnetID)
-	save()
+	log.Printf("[create] VPC: %s, public subnet: %s, private subnet: %s, NAT GW: %s",
+		state.Config.VPCID, state.Config.PublicSubnetID,
+		state.Config.SubnetID, state.Config.NATGatewayID)
 
 	// 5. Create security groups.
 	log.Printf("[create] creating security groups")
 	state.Config.ControlPlaneSGID, state.Config.WorkerSGID, err = awspkg.CreateSecurityGroups(
-		ctx, m.ec2Client, state.Config.VPCID, cfg.Name,
+		ctx, m.ec2Client, state.Config.VPCID, cfg.Name, ct,
+		awspkg.SGAllowedCIDRs{
+			TalosAPI: cfg.AllowedCIDRs.TalosAPI,
+			K8sAPI:   cfg.AllowedCIDRs.K8sAPI,
+			Ingress:  cfg.AllowedCIDRs.Ingress,
+		},
 	)
 	if err != nil {
 		cleanup()
@@ -118,10 +159,33 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	}
 	save()
 
-	// 6. Launch control plane instance.
+	// 6. Create the NLB with the cluster EIP pinned to it.
+	// This is what the Talos and k8s configs point to as the control plane endpoint.
+	log.Printf("[create] creating NLB with EIP %s", state.Config.EIPID)
+	nlbIDs, err := awspkg.CreateNLB(ctx, m.elbClient, awspkg.NLBParams{
+		Tags:            ct,
+		VPCID:           state.Config.VPCID,
+		PublicSubnetID:  state.Config.PublicSubnetID,
+		EIPAllocationID: state.Config.EIPID,
+	})
+	// Copy partial IDs into state BEFORE checking err so cleanup() can
+	// delete the NLB/TGs if the function failed after creating some of them.
+	state.Config.NLBARN = nlbIDs.NLBARN
+	state.Config.CPTargetGroupARN = nlbIDs.CPTargetGroupARN
+	state.Config.TalosTargetGroupARN = nlbIDs.TalosTargetGroupARN
+	save()
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("create NLB: %w", err)
+	}
+	log.Printf("[create] NLB: %s", state.Config.NLBARN)
+
+	// 7. Launch control plane instance (into the private subnet — no public IP).
 	log.Printf("[create] launching control plane instance")
 	state.Config.ControlPlaneID, err = awspkg.LaunchInstance(ctx, m.ec2Client, awspkg.LaunchParams{
 		ClusterName:  cfg.Name,
+		Tags:         ct,
+		TalosVersion: cfg.TalosVersion,
 		Role:         "controlplane",
 		AMIID:        state.Config.AMIID,
 		InstanceType: cfg.ControlPlaneType,
@@ -136,26 +200,32 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 	log.Printf("[create] control plane instance: %s", state.Config.ControlPlaneID)
 	save()
 
-	// 7. Wait for control plane to reach running state.
+	// 8. Wait for control plane to reach running state.
 	log.Printf("[create] waiting for control plane instance to be running")
 	if err = awspkg.WaitForInstanceRunning(ctx, m.ec2Client, state.Config.ControlPlaneID); err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("wait for control plane: %w", err)
 	}
 
-	// 8. Associate the pre-allocated EIP with the control plane instance.
-	log.Printf("[create] associating EIP %s with %s", state.Config.EIPID, state.Config.ControlPlaneID)
-	if err = awspkg.AssociateEIP(ctx, m.ec2Client, state.Config.EIPID, state.Config.ControlPlaneID); err != nil {
+	// 9. Register control plane with both NLB target groups.
+	log.Printf("[create] registering control plane with NLB target groups")
+	if err = awspkg.RegisterTargetsCP(ctx, m.elbClient,
+		state.Config.CPTargetGroupARN,
+		state.Config.TalosTargetGroupARN,
+		state.Config.ControlPlaneID,
+	); err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("associate EIP: %w", err)
+		return nil, nil, fmt.Errorf("register NLB targets: %w", err)
 	}
 
-	// 9. Launch worker instances.
+	// 10. Launch worker instances (also in the private subnet).
 	log.Printf("[create] launching %d worker instance(s)", cfg.WorkerCount)
 	state.Config.WorkerIDs = make([]string, 0, cfg.WorkerCount)
 	for i := 0; i < cfg.WorkerCount; i++ {
 		workerID, err := awspkg.LaunchInstance(ctx, m.ec2Client, awspkg.LaunchParams{
 			ClusterName:  cfg.Name,
+			Tags:         ct,
+			TalosVersion: cfg.TalosVersion,
 			Role:         fmt.Sprintf("worker-%d", i),
 			AMIID:        state.Config.AMIID,
 			InstanceType: cfg.WorkerType,
@@ -172,7 +242,7 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 		save() // save after each worker so a partial worker list is recoverable
 	}
 
-	// 10. Wait for all workers to reach running state.
+	// 11. Wait for all workers to reach running state.
 	log.Printf("[create] waiting for worker instances to be running")
 	for _, wid := range state.Config.WorkerIDs {
 		if err = awspkg.WaitForInstanceRunning(ctx, m.ec2Client, wid); err != nil {
@@ -181,14 +251,14 @@ func (m *Manager) Create(ctx context.Context, cfg ClusterConfig, progress Progre
 		}
 	}
 
-	// 11. Wait for Talos API to be available on the control plane.
+	// 12. Wait for Talos API to be available via the NLB EIP.
 	log.Printf("[create] waiting for Talos API on %s", state.Config.ControlPlaneIP)
 	if err = talospkg.WaitForTalosAPI(ctx, state.Config.ControlPlaneIP, configs.Talosconfig); err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("wait for Talos API: %w", err)
 	}
 
-	// 12. Bootstrap etcd on the control plane.
+	// 13. Bootstrap etcd on the control plane.
 	log.Printf("[create] bootstrapping etcd")
 	if err = talospkg.BootstrapCluster(ctx, state.Config.ControlPlaneIP, configs.Talosconfig); err != nil {
 		cleanup()
@@ -217,7 +287,19 @@ func (m *Manager) Delete(ctx context.Context, state *ClusterState) error {
 		}
 	}
 
-	// 2. Release Elastic IP.
+	// 2. Delete the NLB and target groups.
+	// Must happen before releasing the cluster EIP (NLB holds it) and before
+	// deleting networking (NLB sits in the public subnet).
+	if cfg.NLBARN != "" || cfg.CPTargetGroupARN != "" || cfg.TalosTargetGroupARN != "" {
+		log.Printf("[delete] deleting NLB %s", cfg.NLBARN)
+		if err := awspkg.DeleteNLB(ctx, m.elbClient,
+			cfg.NLBARN, cfg.CPTargetGroupARN, cfg.TalosTargetGroupARN,
+		); err != nil {
+			return fmt.Errorf("delete NLB: %w", err)
+		}
+	}
+
+	// 3. Release the cluster Elastic IP (was held by the NLB).
 	if cfg.EIPID != "" {
 		log.Printf("[delete] releasing EIP %s", cfg.EIPID)
 		if err := awspkg.ReleaseEIP(ctx, m.ec2Client, cfg.EIPID); err != nil {
@@ -225,13 +307,21 @@ func (m *Manager) Delete(ctx context.Context, state *ClusterState) error {
 		}
 	}
 
-	// 3. Delete networking (SGs, subnet, IGW, VPC).
+	// 4. Delete networking (SGs, NAT GW + its EIP, route tables, subnets, IGW, VPC).
 	if cfg.VPCID != "" {
 		log.Printf("[delete] deleting networking")
-		if err := awspkg.DeleteNetworking(ctx, m.ec2Client,
-			cfg.VPCID, cfg.SubnetID, cfg.IGWID, cfg.RouteTableID,
-			cfg.ControlPlaneSGID, cfg.WorkerSGID,
-		); err != nil {
+		if err := awspkg.DeleteNetworking(ctx, m.ec2Client, awspkg.DeleteNetworkingParams{
+			VPCID:               cfg.VPCID,
+			PublicSubnetID:      cfg.PublicSubnetID,
+			PrivateSubnetID:     cfg.SubnetID,
+			IGWID:               cfg.IGWID,
+			PublicRouteTableID:  cfg.RouteTableID,
+			PrivateRouteTableID: cfg.PrivateRouteTableID,
+			NATGatewayID:        cfg.NATGatewayID,
+			NATGatewayEIPID:     cfg.NATGatewayEIPID,
+			CPSGID:              cfg.ControlPlaneSGID,
+			WorkerSGID:          cfg.WorkerSGID,
+		}); err != nil {
 			return fmt.Errorf("delete networking: %w", err)
 		}
 	}
