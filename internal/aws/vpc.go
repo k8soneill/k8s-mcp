@@ -524,7 +524,8 @@ func isEC2NotFound(err error) bool {
 		return false
 	}
 	switch apiErr.ErrorCode() {
-	case "InvalidGroup.NotFound",
+	case "InvalidInstanceID.NotFound", "InvalidInstanceId.NotFound",
+		"InvalidGroup.NotFound",
 		"InvalidRouteTableID.NotFound", "InvalidRouteTableId.NotFound",
 		"InvalidSubnetID.NotFound", "InvalidSubnetId.NotFound",
 		"InvalidInternetGatewayID.NotFound",
