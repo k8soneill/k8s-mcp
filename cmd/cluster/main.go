@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/netip"
@@ -15,7 +14,6 @@ import (
 	talospkg "k8s-mcp/internal/talos"
 
 	"github.com/spf13/cobra"
-	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 )
 
 func main() {
@@ -38,17 +36,17 @@ func rootCmd() *cobra.Command {
 
 func createCmd() *cobra.Command {
 	var (
-		name               string
-		region             string
-		talosVersion       string
-		kubeVersion        string
-		workerCount        int
-		controlPlaneType   string
-		workerType         string
-		amiID              string
-		stateOut           string
-		allowedTalosCIDRs  string
-		allowedK8sCIDRs    string
+		name                string
+		region              string
+		talosVersion        string
+		kubeVersion         string
+		workerCount         int
+		controlPlaneType    string
+		workerType          string
+		amiID               string
+		stateOut            string
+		allowedTalosCIDRs   string
+		allowedK8sCIDRs     string
 		allowedIngressCIDRs string
 	)
 
@@ -105,6 +103,7 @@ func createCmd() *cobra.Command {
 				AllowedCIDRs:     allowedCIDRs,
 			}
 
+			// Setup manager this returns a Manager struct with ec2 and elb clients and the region
 			ctx := context.Background()
 			debug, _ := cmd.Flags().GetBool("debug")
 			mgr, err := cluster.NewManager(ctx, region, debug)
@@ -115,7 +114,7 @@ func createCmd() *cobra.Command {
 			// Write state after each resource allocation so a killed process
 			// leaves a file that can be passed to `delete` for cleanup.
 			progress := func(s *cluster.ClusterState) {
-				if err := writeState(stateOut, s); err != nil {
+				if err := cluster.WriteState(stateOut, s); err != nil {
 					log.Printf("warn: could not save state: %v", err)
 				}
 			}
@@ -126,7 +125,7 @@ func createCmd() *cobra.Command {
 			}
 
 			// Save talosconfig — needed later to fetch a kubeconfig.
-			if err := saveTalosconfig(talosconfigOut, tc); err != nil {
+			if err := talospkg.SaveTalosconfig(talosconfigOut, tc); err != nil {
 				log.Printf("warn: could not save talosconfig: %v", err)
 			}
 
@@ -170,9 +169,9 @@ func deleteCmd() *cobra.Command {
 				return fmt.Errorf("--state is required")
 			}
 
-			state, err := readState(statePath)
+			state, err := cluster.ReadState(statePath)
 			if err != nil {
-				return fmt.Errorf("read state file: %w", err)
+				return err
 			}
 
 			ctx := context.Background()
@@ -187,7 +186,7 @@ func deleteCmd() *cobra.Command {
 			}
 
 			// Overwrite state file with final deleted status.
-			if err := writeState(statePath, state); err != nil {
+			if err := cluster.WriteState(statePath, state); err != nil {
 				log.Printf("warn: could not update state file: %v", err)
 			}
 
@@ -221,9 +220,9 @@ the kubeconfig — retry if the command fails immediately after create.`,
 				return fmt.Errorf("--state is required")
 			}
 
-			state, err := readState(statePath)
+			state, err := cluster.ReadState(statePath)
 			if err != nil {
-				return fmt.Errorf("read state file: %w", err)
+				return err
 			}
 
 			// Derive talosconfig path from cluster name + ID if not provided.
@@ -242,7 +241,7 @@ the kubeconfig — retry if the command fails immediately after create.`,
 				}
 			}
 
-			tc, err := loadTalosconfig(talosconfigPath)
+			tc, err := talospkg.LoadTalosconfig(talosconfigPath)
 			if err != nil {
 				return fmt.Errorf("load talosconfig: %w", err)
 			}
@@ -304,44 +303,4 @@ func generateClusterID() (string, error) {
 		return "", fmt.Errorf("generate cluster ID: %w", err)
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func writeState(path string, state *cluster.ClusterState) error {
-	b, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, b, 0600)
-}
-
-func readState(path string) (*cluster.ClusterState, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var state cluster.ClusterState
-	if err := json.Unmarshal(b, &state); err != nil {
-		return nil, err
-	}
-	return &state, nil
-}
-
-func saveTalosconfig(path string, tc *clientconfig.Config) error {
-	b, err := tc.Bytes()
-	if err != nil {
-		return fmt.Errorf("marshal talosconfig: %w", err)
-	}
-	return os.WriteFile(path, b, 0600)
-}
-
-func loadTalosconfig(path string) (*clientconfig.Config, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	tc, err := clientconfig.FromBytes(b)
-	if err != nil {
-		return nil, fmt.Errorf("parse talosconfig: %w", err)
-	}
-	return tc, nil
 }
