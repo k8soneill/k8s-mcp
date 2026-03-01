@@ -167,6 +167,7 @@ func RegisterTargetsCP(ctx context.Context, client *elasticloadbalancingv2.Clien
 
 // DeleteNLB deletes the NLB (waiting for full deletion) then deletes both
 // target groups. Safe to call with empty strings (skips those resources).
+// Idempotent: already-deleted resources are silently skipped.
 func DeleteNLB(ctx context.Context, client *elasticloadbalancingv2.Client,
 	nlbARN, cpTGARN, talosTGARN string) error {
 
@@ -174,10 +175,15 @@ func DeleteNLB(ctx context.Context, client *elasticloadbalancingv2.Client,
 		if _, err := client.DeleteLoadBalancer(ctx, &elasticloadbalancingv2.DeleteLoadBalancerInput{
 			LoadBalancerArn: aws.String(nlbARN),
 		}); err != nil {
-			return fmt.Errorf("delete NLB: %w", err)
-		}
-		if err := waitForNLBDeleted(ctx, client, nlbARN); err != nil {
-			return fmt.Errorf("wait for NLB deletion: %w", err)
+			var lbNotFound *elbtypes.LoadBalancerNotFoundException
+			if !errors.As(err, &lbNotFound) {
+				return fmt.Errorf("delete NLB: %w", err)
+			}
+			// Already gone — skip the wait.
+		} else {
+			if err := waitForNLBDeleted(ctx, client, nlbARN); err != nil {
+				return fmt.Errorf("wait for NLB deletion: %w", err)
+			}
 		}
 	}
 
@@ -188,7 +194,10 @@ func DeleteNLB(ctx context.Context, client *elasticloadbalancingv2.Client,
 		if _, err := client.DeleteTargetGroup(ctx, &elasticloadbalancingv2.DeleteTargetGroupInput{
 			TargetGroupArn: aws.String(tgARN),
 		}); err != nil {
-			return fmt.Errorf("delete target group %s: %w", tgARN, err)
+			var tgNotFound *elbtypes.TargetGroupNotFoundException
+			if !errors.As(err, &tgNotFound) {
+				return fmt.Errorf("delete target group %s: %w", tgARN, err)
+			}
 		}
 	}
 

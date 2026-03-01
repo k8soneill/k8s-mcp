@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -54,15 +55,54 @@ func AssociateEIP(ctx context.Context, client *ec2.Client, allocationID, instanc
 	return nil
 }
 
-// ReleaseEIP releases an Elastic IP allocation.
+// ReleaseEIP releases an Elastic IP allocation. It is idempotent: if the EIP
+// is already released it returns nil. If the EIP is still associated with a
+// resource (e.g. a recently-deleted NLB), it polls until the association is
+// cleared and then releases, retrying for up to 3 minutes.
 func ReleaseEIP(ctx context.Context, client *ec2.Client, allocationID string) error {
-	_, err := client.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
-		AllocationId: aws.String(allocationID),
-	})
-	if err != nil {
-		return fmt.Errorf("release EIP %s: %w", allocationID, err)
+	const maxAttempts = 12
+	for attempt := range maxAttempts {
+		_, err := client.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
+			AllocationId: aws.String(allocationID),
+		})
+		if err == nil {
+			return nil
+		}
+
+		// Already released.
+		if isEC2NotFound(err) {
+			return nil
+		}
+
+		// Check whether the EIP is still associated with a resource.
+		// If so, wait and retry (e.g. NLB ENI hasn't been cleaned up yet).
+		// If not, this is a real error (permissions, etc.) — fail fast.
+		desc, descErr := client.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
+			AllocationIds: []string{allocationID},
+		})
+		if descErr != nil {
+			if isEC2NotFound(descErr) {
+				return nil // EIP gone between release and describe
+			}
+			return fmt.Errorf("release EIP %s: %w", allocationID, err)
+		}
+		if len(desc.Addresses) == 0 {
+			return nil
+		}
+		if desc.Addresses[0].AssociationId == nil {
+			// EIP exists and is not associated — this is a real error.
+			return fmt.Errorf("release EIP %s: %w", allocationID, err)
+		}
+
+		// EIP is still associated — wait for the association to clear.
+		log.Printf("[delete] EIP %s still associated, retrying (%d/%d)", allocationID, attempt+1, maxAttempts)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
 	}
-	return nil
+	return fmt.Errorf("release EIP %s: still associated after %d attempts", allocationID, maxAttempts)
 }
 
 // gzipBase64 gzip-compresses data and returns the base64-encoded result.
@@ -145,30 +185,51 @@ func WaitForInstanceRunning(ctx context.Context, client *ec2.Client, instanceID 
 }
 
 // TerminateInstances terminates the given instances and waits for them to reach
-// the "terminated" state (up to 15 minutes).
+// the "terminated" state (up to 15 minutes). It is idempotent: instances that
+// no longer exist or are already terminated are silently skipped.
 func TerminateInstances(ctx context.Context, client *ec2.Client, instanceIDs []string) error {
 	if len(instanceIDs) == 0 {
 		return nil
 	}
 
-	_, err := client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
-		InstanceIds: instanceIDs,
-	})
+	// Pre-filter to instances that still exist and aren't already terminated.
+	// Using a filter (not InstanceIds) so DescribeInstances won't error on
+	// IDs that have been purged from the API.
+	active, err := findActiveInstances(ctx, client, instanceIDs)
 	if err != nil {
+		return fmt.Errorf("describe instances before termination: %w", err)
+	}
+	if len(active) == 0 {
+		return nil
+	}
+
+	if _, err := client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
+		InstanceIds: active,
+	}); err != nil {
 		return fmt.Errorf("terminate instances: %w", err)
 	}
 
+	// Wait for only the instances we actually terminated.
 	deadline := time.Now().Add(15 * time.Minute)
-	remaining := make(map[string]struct{}, len(instanceIDs))
-	for _, id := range instanceIDs {
+	remaining := make(map[string]struct{}, len(active))
+	for _, id := range active {
 		remaining[id] = struct{}{}
 	}
 
 	for time.Now().Before(deadline) && len(remaining) > 0 {
+		// Build a slice from remaining keys to describe only what we're waiting on.
+		ids := make([]string, 0, len(remaining))
+		for id := range remaining {
+			ids = append(ids, id)
+		}
+
 		out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-			InstanceIds: instanceIDs,
+			InstanceIds: ids,
 		})
 		if err != nil {
+			if isEC2NotFound(err) {
+				return nil
+			}
 			return fmt.Errorf("describe instances while waiting for termination: %w", err)
 		}
 		for _, r := range out.Reservations {
@@ -192,4 +253,27 @@ func TerminateInstances(ctx context.Context, client *ec2.Client, instanceIDs []s
 		return fmt.Errorf("instances not terminated within 15 minutes: %v", remaining)
 	}
 	return nil
+}
+
+// findActiveInstances returns the subset of instanceIDs that exist and are not
+// yet in the "terminated" state. Uses a filter query so missing IDs don't
+// cause an API error.
+func findActiveInstances(ctx context.Context, client *ec2.Client, instanceIDs []string) ([]string, error) {
+	out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{Name: aws.String("instance-id"), Values: instanceIDs},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var active []string
+	for _, r := range out.Reservations {
+		for _, inst := range r.Instances {
+			if inst.State != nil && inst.State.Name != types.InstanceStateNameTerminated {
+				active = append(active, aws.ToString(inst.InstanceId))
+			}
+		}
+	}
+	return active, nil
 }
